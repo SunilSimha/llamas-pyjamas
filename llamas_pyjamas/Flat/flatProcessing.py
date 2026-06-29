@@ -3,11 +3,9 @@ import glob
 import pdb
 import argparse
 import ray
-import psutil
 import pkg_resources
 from pathlib import Path
 import logging
-import llamas_pyjamas
 from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR
 from llamas_pyjamas.File.llamasIO import process_fits_by_color
 from llamas_pyjamas.Image.WhiteLightModule import WhiteLightFits
@@ -23,6 +21,7 @@ import numpy as np
 from llamas_pyjamas.Trace.traceLlamasMaster import _grab_bias_hdu, TraceRay
 from llamas_pyjamas.DataModel.validate import validate_for_gui
 import llamas_pyjamas.Trace.traceLlamasMaster as traceLlamasMaster
+from llamas_pyjamas.Utils.ray_manager import init_ray_cluster
 
 from llamas_pyjamas.constants import RED_IDXS, GREEN_IDXS, BLUE_IDXS, N_det
 
@@ -97,7 +96,8 @@ def load_bias_subtracted_flat_2d(flat_fits_file, channel, bench, side, bias_file
 
     return flat_2d
 
-def reduce_flat(filename, idxs, tracedir=None, channel=None, save_dir=OUTPUT_DIR, use_bias=None) -> None:
+def reduce_flat(filename, idxs, tracedir=None, channel=None, save_dir=OUTPUT_DIR,
+                use_bias=None, ray_options=None) -> None:
     """Reduce the flat field image and save the extractions to a pickle file.
 
     :param filename: the flat field image to reduce, must be of type FITS
@@ -117,9 +117,6 @@ def reduce_flat(filename, idxs, tracedir=None, channel=None, save_dir=OUTPUT_DIR
     assert type(idxs) == list, 'idxs must be a list of integers'
     package_path = pkg_resources.resource_filename('llamas_pyjamas', '')
     package_root = os.path.dirname(package_path)
-    import shutil as _shutil, glob as _glob2
-    for _stale in _glob2.glob('/tmp/ray/session_*/runtime_resources/py_modules_files'):
-        _shutil.rmtree(_stale, ignore_errors=True)
     runtime_env = {
             "working_dir": package_root,
             "env_vars": {"PYTHONPATH": f"{package_root}:{os.environ.get('PYTHONPATH', '')}"},
@@ -145,31 +142,13 @@ def reduce_flat(filename, idxs, tracedir=None, channel=None, save_dir=OUTPUT_DIR
     # Limit object store memory to prevent OOM (2 GB default)
     object_store_mb = int(os.environ.get('LLAMAS_RAY_OBJECT_STORE_MB', 2048))
     object_store_memory = object_store_mb * 1024 * 1024
-    # On macOS Ray raises ValueError for an object store > 2 GiB unless this is set.
-    # GUI_extract (the science-extraction path) already sets it; mirror that here so
-    # the flat-field Ray init doesn't fail silently when LLAMAS_RAY_OBJECT_STORE_MB > 2048.
-    os.environ['RAY_ENABLE_MAC_LARGE_OBJECT_STORE'] = '1'
 
-    # Clamp the object store to ≤30% of RAM so it can't starve Ray's logical `memory`
-    # pool (auto-detected ≈ free RAM − object store). Mirrors GUI_extract.
-    total_mb = psutil.virtual_memory().total // (1024 * 1024)
-    store_cap_mb = int(total_mb * 0.30)
-    if object_store_mb > store_cap_mb:
-        logger.warning(f"Clamping Ray object store {object_store_mb}→{store_cap_mb} MB "
-                       f"(30% of {total_mb} MB RAM) to preserve scheduler memory pool")
-        object_store_mb = store_cap_mb
-        object_store_memory = object_store_mb * 1024 * 1024
-
-    logger.info(f"[flat] package={llamas_pyjamas.__file__}")
-    logger.info(f"[flat] ray.init num_cpus={num_cpus} object_store={object_store_mb}MB "
-                f"free_RAM={psutil.virtual_memory().available // (1024 * 1024)}MB")
-
-    ray.shutdown()
-    ray.init(
+    init_ray_cluster(
         num_cpus=num_cpus,
         runtime_env=runtime_env,
-        object_store_memory=object_store_memory
-    )
+        object_store_memory=object_store_memory,
+        ray_options=ray_options,
+    )    
     
     
     _extractions = []
@@ -320,7 +299,9 @@ def reduce_flat(filename, idxs, tracedir=None, channel=None, save_dir=OUTPUT_DIR
     return 
 
 
-def produce_flat_extractions(red_flat, green_flat, blue_flat, tracedir=None, outpath=None, verbose=False, use_bias=None) -> Tuple[List, List]:
+def produce_flat_extractions(red_flat, green_flat, blue_flat, tracedir=None,
+                             outpath=None, verbose=False, use_bias=None,
+                             ray_options=None) -> Tuple[List, List]:
     """Produce flat field extractions for each color channel.
 
     :param red_flat: file to use for red channel flat field extraction
@@ -354,11 +335,14 @@ def produce_flat_extractions(red_flat, green_flat, blue_flat, tracedir=None, out
     logger.info(f'Using output directory: {output_directory}')
 
     # Reduce the red flat field image
-    reduce_flat(red_flat, RED_IDXS, tracedir=tracedir, channel='red', save_dir=output_directory, use_bias=use_bias)
+    reduce_flat(red_flat, RED_IDXS, tracedir=tracedir, channel='red', save_dir=output_directory,
+               use_bias=use_bias, ray_options=ray_options)
     # Reduce the green flat field image
-    reduce_flat(green_flat, GREEN_IDXS, tracedir=tracedir, channel='green', save_dir=output_directory, use_bias=use_bias)
+    reduce_flat(green_flat, GREEN_IDXS, tracedir=tracedir, channel='green', save_dir=output_directory,
+               use_bias=use_bias, ray_options=ray_options)
     # Reduce the blue flat field image
-    reduce_flat(blue_flat, BLUE_IDXS, tracedir=tracedir, channel='blue', save_dir=output_directory, use_bias=use_bias)
+    reduce_flat(blue_flat, BLUE_IDXS, tracedir=tracedir, channel='blue', save_dir=output_directory,
+               use_bias=use_bias, ray_options=ray_options)
 
     logger.info('Flat field extractions complete.')
 
