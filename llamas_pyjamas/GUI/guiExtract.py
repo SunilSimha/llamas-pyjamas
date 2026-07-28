@@ -17,8 +17,8 @@ import pkg_resources
 from pathlib import Path
 
 import llamas_pyjamas
-from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR
-from llamas_pyjamas.Trace.traceLlamasMaster import _grab_bias_hdu, TraceRay
+from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR, DARK_DIR
+from llamas_pyjamas.Trace.traceLlamasMaster import _grab_bias_hdu, _grab_dark_hdu, TraceRay
 import llamas_pyjamas.Trace.traceLlamasMaster as traceLlamasMaster
 import sys
 sys.modules['traceLlamasMaster'] = traceLlamasMaster
@@ -33,6 +33,7 @@ from llamas_pyjamas.Bias import BiasNotFoundError, BiasReadModeError, generate_f
 from llamas_pyjamas.Bias.biasChecking import (build_interfibre_mask,
                                               build_topbottom_stripe_mask,
                                               measure_edge_dc_offset)
+from llamas_pyjamas.Dark import DarkNotFoundError, DarkReadModeError
 from llamas_pyjamas.Masking.cosmicLlamas import clean_cosmic_rays, save_cosmic_ray_masks
 
 # Set up logging
@@ -297,9 +298,10 @@ def _write_edge_qa_rows(qa_csv, science_file, primary_hdr, results):
 
 @ray.remote
 def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use_bias=None,
-                  remove_cosmic_rays=True, edge_bias=None):
+                  use_dark=None, remove_cosmic_rays=True, edge_bias=None):
     """
-    Process a single HDU: subtract bias, load the trace from a trace file, and create an ExtractLlamas object.
+    Process a single HDU: subtract bias, subtract dark current, load the trace
+    from a trace file, and create an ExtractLlamas object.
 
     The tracer is loaded first so its fiberimg can be used for an inter-fibre
     bias quality check and, when needed, an inter-fibre fallback bias estimate.
@@ -314,9 +316,18 @@ def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use
        which cross-validates inter-fibre vs test-region (rows 30-50) estimates and
        selects the better one.
 
+    Dark-current selection logic (applied right after bias subtraction, before
+    the per-frame edge-bias DC correction, cosmic-ray cleaning, and extraction):
+    1. Try to load master dark-rate extension (DN/s) from use_dark file.
+    2. If loaded, verify bench/side/color match.
+    3. If verified, subtract master_dark_rate * REXPTIME from the bias-subtracted data.
+    Unlike bias, there is no fallback estimate for dark current — if no valid
+    master dark is available (or REXPTIME is missing), dark subtraction is
+    skipped for that extension and DARKSUB is recorded as False.
+
     Returns a dict containing:
         'extraction': ExtractLlamas object (or None if error)
-        'detector_background': median background after bias subtraction
+        'detector_background': median background after bias/dark subtraction
         'hdu_index': the HDU index for this extraction
     """
     _BIAS_INTERFIBRE_LOG_THRESHOLD = 10.0  # DN — divergence above which a diagnostic warning is logged
@@ -337,6 +348,9 @@ def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use
         with open(trace_file, mode='rb') as f:
             tracer = cloudpickle.load(f)
 
+        # Resolved once, used by both the bias and dark selection logic below.
+        frame_mode = header.get('READ-MDE', None)
+
         # Guard against double-subtraction
         if header.get('BIASSUB', False):
             logger.warning(
@@ -345,7 +359,6 @@ def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use
             bias_subtracted_data = hdu_data.astype(float)
         else:
             # use_bias is the resolved bias file path from GUI_extract (may be None)
-            frame_mode = header.get('READ-MDE', None)
             bias = None
 
             if use_bias is not None:
@@ -438,6 +451,65 @@ def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use
             header['BIASSUB'] = (True, 'True = bias was subtracted')
             header['BIASSRC'] = (bias.header.get('BIASSRC', 'master_bias'), 'Source of bias subtracted')
             header['BIASLVL'] = (float(np.nanmedian(bias_data)), 'Median bias level subtracted (DN)')
+
+        # --- Dark-current subtraction, on top of master bias ---
+        # Runs right after bias subtraction and before the edge-bias DC correction,
+        # cosmic-ray cleaning, and extraction (i.e. before any flat-fielding or
+        # wavelength-calibration stage downstream). There is no fallback estimate
+        # for dark current — if no valid master dark is available, this is a no-op.
+        if header.get('DARKSUB', False):
+            logger.warning(
+                f"DARKSUB already set for {bench}{side} {color} — skipping dark subtraction"
+            )
+        else:
+            exptime = header.get('REXPTIME', None)
+            dark = None
+
+            if use_dark is not None and exptime is None:
+                logger.warning(
+                    f"No REXPTIME in header for {bench}{side} {color}; skipping dark subtraction"
+                )
+            elif use_dark is not None:
+                dark_file = os.fspath(use_dark)
+                try:
+                    dark = _grab_dark_hdu(bench=bench, side=side, color=color,
+                                          dir=dark_file, required_readmode=frame_mode)
+                    logger.info(f"Loaded master dark for {bench}{side} {color}")
+                except (DarkNotFoundError, DarkReadModeError) as e:
+                    logger.warning(f"Master dark failed for {bench}{side} {color}: {e}")
+                    dark = None
+            else:
+                logger.info(f"No dark file path received for {bench}{side} {color}; skipping dark subtraction")
+
+            if dark is not None:
+                # --- Bench/side/color verification before subtraction ---
+                dark_bench = str(dark.header.get('BENCH', '')).strip()
+                dark_side  = str(dark.header.get('SIDE',  '')).strip().upper()
+                dark_color = str(dark.header.get('COLOR', '')).strip().lower()
+                if not (dark_bench and dark_side and dark_color) and 'CAM_NAME' in dark.header:
+                    cam = dark.header['CAM_NAME']
+                    parts = cam.split('_')
+                    dark_color = parts[1].lower() if len(parts) >= 2 else ''
+                    dark_bench = parts[0][0] if parts else ''
+                    dark_side  = parts[0][1].upper() if parts and len(parts[0]) >= 2 else ''
+
+                if (dark_bench and dark_side and dark_color and
+                        (dark_bench != str(bench) or dark_side != str(side).upper() or
+                         dark_color != str(color).lower())):
+                    logger.error(
+                        f"Dark BSC mismatch: expected {bench}{side} {color}, "
+                        f"got {dark_bench}{dark_side} {dark_color} — skipping dark subtraction"
+                    )
+                    dark = None
+
+            if dark is not None:
+                dark_level = dark.data.astype(float) * float(exptime)
+                bias_subtracted_data = bias_subtracted_data - dark_level
+                header['DARKSUB'] = (True, 'True = dark current was subtracted')
+                header['DARKLVL'] = (float(np.nanmedian(dark_level)), 'Median dark level subtracted (DN)')
+                header['DARKEXP'] = (float(exptime), 'Exposure time (s) used to scale the master dark')
+            else:
+                header['DARKSUB'] = (False, 'True = dark current was subtracted')
 
         # --- Per-frame edge-bias (DC offset) correction, on top of master bias ---
         # Measures the residual DC level from unilluminated pixels of THIS frame and
@@ -561,6 +633,7 @@ def compute_detector_background(data, rows=(30, 50)):
 
 def GUI_extract(file: fits.BinTableHDU, flatfiles: str = None, output_dir: str = None,
                 slow_bias: str = None, fast_bias: str = None,
+                dark_file: str = None,
                 method='optimal', trace_dir=None, mastercalib_trace_dir=None,
                 remove_cosmic_rays=True, mask_output_dir=None, force_refresh=False,
                 edge_bias=None) -> None:
@@ -576,12 +649,22 @@ def GUI_extract(file: fits.BinTableHDU, flatfiles: str = None, output_dir: str =
     If neither is provided the function falls back to package-default paths in BIAS_DIR.
     If no bias files exist at all, process_trace() applies a test-region (rows 30-50) fallback.
 
+    Raw dark frames are taken in SLOW read-mode only, so there is a single
+    master dark file (not a slow/fast pair). If dark_file is provided it takes
+    priority over the package default in DARK_DIR. Dark subtraction happens
+    inside process_trace() right after bias subtraction, before edge-bias/
+    cosmic-ray/extraction, and only for SLOW-mode frames — FAST-mode frames
+    have no corresponding master dark, so dark subtraction is skipped for
+    them. Unlike bias, there is no fallback dark estimate — if no dark file
+    is available for the frame's read-mode, dark subtraction is simply skipped.
+
     Parameters:
     file (str): Path to the FITS file to be processed. Must have a .fits extension.
     flatfiles (str, optional): Path to the flat files for generating new traces. Defaults to None.
     output_dir (str, optional): Output directory for extraction files. Defaults to None.
     slow_bias (str, optional): Path to the SLOW-mode master bias FITS file. Defaults to None.
     fast_bias (str, optional): Path to the FAST-mode master bias FITS file. Defaults to None.
+    dark_file (str, optional): Path to the (SLOW-mode-only) master dark FITS file. Defaults to None.
     method (str, optional): Extraction method ('optimal' or 'boxcar'). Defaults to 'optimal'.
     trace_dir (str, optional): User trace directory for real extensions. Defaults to None.
     mastercalib_trace_dir (str, optional): Mastercalib trace directory for placeholder extensions.
@@ -671,10 +754,38 @@ def GUI_extract(file: fits.BinTableHDU, flatfiles: str = None, output_dir: str =
         if masterbiasfile is not None:
             masterbiasfile = validate_for_gui(masterbiasfile)
 
+        if read_mode == 'FAST':
+            # Raw dark frames are SLOW-mode only — no master dark applies to FAST frames.
+            masterdarkfile = None
+            logger.info(
+                "READ-MDE=FAST: dark frames are SLOW-mode only; skipping dark subtraction"
+            )
+        elif dark_file is not None:
+            # Caller supplied an explicit path — takes priority over the package default
+            masterdarkfile = dark_file
+            logger.info(f"Using caller-supplied master dark: {masterdarkfile}")
+        else:
+            # No caller path supplied — check the package-default location in DARK_DIR
+            default_dark = os.path.join(DARK_DIR, 'master_dark.fits')
+            if os.path.isfile(default_dark):
+                masterdarkfile = default_dark
+                logger.info(f"Auto-selected master dark from DARK_DIR: {masterdarkfile}")
+            else:
+                # No default exists — dark subtraction will be skipped
+                masterdarkfile = None
+                logger.info(
+                    "No master dark file found in DARK_DIR; dark subtraction will be skipped per extension"
+                )
+
+        # Validate dark file structure (add placeholders for missing cameras)
+        if masterdarkfile is not None:
+            masterdarkfile = validate_for_gui(masterdarkfile)
+
         #Debug statements
         print(f'basefile = {basefile}')
         print(f'masterfile = {masterfile}')
         print(f'Bias file is {masterbiasfile}')
+        print(f'Dark file is {masterdarkfile}')
 
         # Default mastercalib location
         if mastercalib_trace_dir is None:
@@ -749,9 +860,9 @@ def GUI_extract(file: fits.BinTableHDU, flatfiles: str = None, output_dir: str =
             hdr = hdu[hdu_index].header
 
             if (method == 'optimal'):
-                future = extract_fn.remote(hdu_data, hdr, trace_file, hdu_index, method='optimal', use_bias=masterbiasfile, remove_cosmic_rays=remove_cosmic_rays, edge_bias=edge_bias)
+                future = extract_fn.remote(hdu_data, hdr, trace_file, hdu_index, method='optimal', use_bias=masterbiasfile, use_dark=masterdarkfile, remove_cosmic_rays=remove_cosmic_rays, edge_bias=edge_bias)
             elif (method == 'boxcar'):
-                future = extract_fn.remote(hdu_data, hdr, trace_file, hdu_index, method='boxcar', use_bias=masterbiasfile, remove_cosmic_rays=remove_cosmic_rays, edge_bias=edge_bias)
+                future = extract_fn.remote(hdu_data, hdr, trace_file, hdu_index, method='boxcar', use_bias=masterbiasfile, use_dark=masterdarkfile, remove_cosmic_rays=remove_cosmic_rays, edge_bias=edge_bias)
             futures.append(future)
 
         # Wait for all remote tasks to complete

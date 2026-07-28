@@ -45,7 +45,7 @@ import multiprocessing
 import argparse
 import cloudpickle
 from scipy.signal import find_peaks
-from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR
+from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR, DARK_DIR
 import pkg_resources
 from pathlib import Path
 import rpdb
@@ -53,6 +53,7 @@ import rpdb
 from llamas_pyjamas.File.llamasIO import process_fits_by_color
 from llamas_pyjamas.constants import idx_lookup
 from llamas_pyjamas.Bias import BiasNotFoundError, BiasReadModeError
+from llamas_pyjamas.Dark import DarkNotFoundError, DarkReadModeError
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,134 @@ def _grab_bias_hdu(bench=None, side=None, color=None, benchside=None,
         )
 
     return bias_hdu
+
+
+def _grab_dark_hdu(bench=None, side=None, color=None, benchside=None,
+                   dir=os.path.join(DARK_DIR, 'master_dark.fits'),
+                   required_readmode=None) -> fits.ImageHDU:
+    """
+    Retrieves the appropriate master-dark-rate HDU (DN/s) from the combined
+    dark file, mirroring ``_grab_bias_hdu`` exactly (same orientation
+    transform, same header-then-CAM_NAME-then-index matching fallback chain).
+
+    Unlike bias, there is only a single master dark file (raw dark exposures
+    are taken in SLOW read-mode only). ``required_readmode`` is still checked
+    against the file's own READ-MDE header as a safety net — a caller that
+    passes ``required_readmode='FAST'`` will correctly get a
+    DarkReadModeError rather than a silently wrong correction.
+
+    Args:
+        bench (str, optional): Bench identifier (e.g., '1', '2', '3', '4').
+        side (str, optional): Side identifier (e.g., 'A', 'B').
+        color (str, optional): Color channel (e.g., 'red', 'green', 'blue').
+        benchside (str, optional): Combined bench and side (e.g., '1A', '4B').
+        dir (str, optional): Path to the combined master dark file.
+        required_readmode (str, optional): READ-MDE the dark file must match.
+
+    Returns:
+        fits.ImageHDU: The master-dark HDU for the specified detector.
+
+    Raises:
+        ValueError: If the combination of parameters is invalid or incomplete.
+        DarkNotFoundError: If the dark file cannot be read.
+        DarkReadModeError: If required_readmode does not match the file's READ-MDE.
+    """
+    if benchside and not (bench and side):
+        if len(benchside) != 2:
+            raise ValueError(f"Invalid benchside format: {benchside}. Expected format: 'NX' where N is bench number and X is side letter.")
+        bench = benchside[0]
+        side = benchside[1]
+
+    if not (bench and side and color):
+        raise ValueError("Must provide either (bench, side, color) or (benchside, color)")
+
+    _tmp_fd, _tmp_path = tempfile.mkstemp(suffix='.fits', prefix='llrs_dark_',
+                                          dir=get_ray_temp_dir())
+    os.close(_tmp_fd)
+    try:
+        dark_hdus, _ = process_fits_by_color(dir, output_file=_tmp_path)
+    finally:
+        if os.path.exists(_tmp_path):
+            os.remove(_tmp_path)
+
+    if dark_hdus is None:
+        calib_path = os.path.join(DARK_DIR, 'master_dark.fits')
+        _tmp_fd2, _tmp_path2 = tempfile.mkstemp(suffix='.fits', prefix='llrs_dark_',
+                                                dir=get_ray_temp_dir())
+        os.close(_tmp_fd2)
+        try:
+            dark_hdus, _ = process_fits_by_color(calib_path, output_file=_tmp_path2)
+        finally:
+            if os.path.exists(_tmp_path2):
+                os.remove(_tmp_path2)
+        if dark_hdus is None:
+            raise DarkNotFoundError(dir)
+        logger.warning(
+            f"Dark file '{dir}' unreadable; using DARK_DIR fallback '{calib_path}'"
+        )
+
+    # Read-mode mismatch check
+    if required_readmode is not None:
+        dark_mode = dark_hdus[0].header.get('READ-MDE', None)
+        if dark_mode is not None and dark_mode.strip().upper() != required_readmode.upper():
+            raise DarkReadModeError(required_readmode, dark_mode, dir)
+
+    # First try to match by header keywords (robust to non-standard extension order)
+    target_color = color.lower()
+    target_bench = str(bench)
+    target_side = side.upper()
+    for hdu in dark_hdus[1:]:
+        hdr = hdu.header
+        if 'COLOR' in hdr and 'BENCH' in hdr and 'SIDE' in hdr:
+            if (str(hdr['BENCH']) == target_bench and
+                str(hdr['SIDE']).upper() == target_side and
+                str(hdr['COLOR']).lower() == target_color):
+                logger.info(
+                    f"Dark HDU matched by header: {target_bench}{target_side} {target_color}"
+                )
+                return hdu
+        elif 'CAM_NAME' in hdr:
+            camname = hdr['CAM_NAME']
+            cam_color = camname.split('_')[1].lower()
+            cam_bench = camname.split('_')[0][0]
+            cam_side = camname.split('_')[0][1].upper()
+            if cam_color == target_color and cam_bench == target_bench and cam_side == target_side:
+                logger.info(
+                    f"Dark HDU matched by CAM_NAME: {target_bench}{target_side} {target_color}"
+                )
+                return hdu
+
+    # Fall back to standard index lookup if header match fails
+    try:
+        dark_idx = idx_lookup.get((target_color, target_bench, target_side))
+        print(f"Dark index: {dark_idx} for {bench}/{side}/{color}")
+    except Exception:
+        raise ValueError(f"Invalid bench/side/color combination: {bench}/{side}/{color}")
+
+    if dark_idx is None or dark_idx >= len(dark_hdus):
+        raise ValueError(
+            f"Dark index lookup failed for {bench}/{side}/{color} in file {dir}"
+        )
+
+    logger.warning(
+        f"Dark HDU matched by index only (header match failed): {target_bench}{target_side} {target_color}"
+    )
+    dark_hdu = dark_hdus[dark_idx]
+
+    # Verify the index-matched HDU actually corresponds to the requested camera
+    hdr = dark_hdu.header
+    matched_color = hdr.get('COLOR', '').lower() if 'COLOR' in hdr else None
+    matched_bench = str(hdr.get('BENCH', '')) if 'BENCH' in hdr else None
+    matched_side = hdr.get('SIDE', '').upper() if 'SIDE' in hdr else None
+
+    if matched_color != target_color or matched_bench != target_bench or matched_side != target_side:
+        raise ValueError(
+            f"Dark index lookup returned wrong camera for {target_bench}{target_side} {target_color}: "
+            f"got {matched_bench}{matched_side} {matched_color} at index {dark_idx}. "
+            f"The dark file may have missing extensions — validate it first."
+        )
+
+    return dark_hdu
 
 
 
