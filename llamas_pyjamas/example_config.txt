@@ -38,6 +38,23 @@
 #fast_bias_file = /path/to/your/fast_master_bias.fits
 
 #==============================================================================
+# DARK CURRENT CALIBRATION (optional)
+#==============================================================================
+# Optional: a single master dark-current-rate FITS file (DN/s), created from
+# raw dark exposures using the DarkLlamas class and placed in the Dark/
+# directory, OR supplied here as a full path. Raw dark frames are taken in
+# SLOW read-mode only, so unlike bias there is no slow/fast pair — the master
+# dark is applied only to SLOW-mode frames; FAST-mode frames never get dark
+# correction. Dark correction is also optional overall — if no master dark is
+# found, dark subtraction is skipped (no fallback estimate is made).
+#
+# Default location (pipeline looks here if no path is specified below):
+#   llamas_pyjamas/Dark/master_dark.fits
+#
+# To use a custom location, uncomment and set the path below:
+#dark_file = /path/to/your/master_dark.fits
+
+#==============================================================================
 # COSMIC RAY REMOVAL
 #==============================================================================
 # Enable L.A.Cosmic cosmic ray removal before spectral extraction (default: True)
