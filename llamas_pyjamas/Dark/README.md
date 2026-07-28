@@ -43,3 +43,9 @@ science_hdul.flush()
 
 The dark module is typically run after bias correction, using the same
 `(COLOR, BENCH, SIDE)`-keyed extension matching as the Bias module.
+
+Raw dark frames are taken in SLOW read-mode only, so unlike the Bias module
+there is a single master dark — the output of
+`master_dark()` should be renamed/placed as `Dark/master_dark.fits` (or
+pointed to via the `dark_file` config key), and it applies only to SLOW-mode
+science frames. FAST-mode frames are never dark-corrected.
