@@ -31,7 +31,7 @@ import gc
 from datetime import datetime
 
 from llamas_pyjamas.Trace.traceLlamasMaster import run_ray_tracing
-from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR, LUT_DIR, SLOW_BIAS_FILE, FAST_BIAS_FILE
+from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR, LUT_DIR, SLOW_BIAS_FILE, FAST_BIAS_FILE, DARK_DIR, DARK_FILE
 from llamas_pyjamas.Extract.extractLlamas import ExtractLlamas, save_extractions
 import llamas_pyjamas.GUI.guiExtract as ge
 from llamas_pyjamas.File.llamasIO import process_fits_by_color
@@ -92,6 +92,7 @@ def get_input_files_from_config(config, file_keys=None):
       """
       if file_keys is None:
           file_keys = ['science_files', 'slow_bias_file', 'fast_bias_file',
+                       'dark_file',
                        'red_flat_file', 'green_flat_file', 'blue_flat_file',
                        'twilight_flat', 'red_twilight_flat',
                        'green_twilight_flat', 'blue_twilight_flat']
@@ -180,6 +181,25 @@ def validate_pipeline_config(config: dict, config_path: str) -> bool:
             p = config[key]
             if not os.path.isfile(p):
                 errors.append(f"'{key}' path does not exist: '{p}'")
+
+    # ------------------------------------------------------------------
+    # 2b. Master dark file check (optional — dark subtraction is skipped,
+    #     not fatal, when no master dark is available). Raw dark frames are
+    #     SLOW-mode only, so there is a single master dark file.
+    # ------------------------------------------------------------------
+    if not os.path.isfile(DARK_FILE):
+        warnings.append(
+            f"Master dark not found: '{DARK_FILE}'. "
+            f"Create it from raw dark frames using DarkLlamas and place it in the Dark/ directory, "
+            f"or set 'dark_file' in your config to a custom path. "
+            f"Dark subtraction will be skipped where unavailable."
+        )
+
+    # Check a user-supplied dark override if present — a wrong explicit path IS an error
+    if 'dark_file' in config:
+        p = config['dark_file']
+        if not os.path.isfile(p):
+            errors.append(f"'dark_file' path does not exist: '{p}'")
 
     # ------------------------------------------------------------------
     # 3. Required config keys
@@ -399,18 +419,21 @@ def generate_traces(red_flat, green_flat, blue_flat, output_dir,
 ###need to edit GUI extract to give custom output_dir
 #currently designed to use skyflats
 #only used for generating new wl solutions
-def extract_flat_field(flat_file_dir, output_dir, slow_bias=None, fast_bias=None):
+def extract_flat_field(flat_file_dir, output_dir, slow_bias=None, fast_bias=None,
+                       dark_file=None):
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     ge.GUI_extract(flat_file_dir, output_dir=output_dir, slow_bias=slow_bias, fast_bias=fast_bias,
+                   dark_file=dark_file,
                    remove_cosmic_rays=False)
 
     return
 
 
 def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
+                   dark_file=None,
                    trace_dir=None, mastercalib_trace_dir=None,
                    remove_cosmic_rays=True, mask_output_dir=None, edge_bias=None):
     """
@@ -421,6 +444,7 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
         output_dir: Output directory for extractions
         slow_bias: Path to SLOW-mode master bias FITS file
         fast_bias: Path to FAST-mode master bias FITS file
+        dark_file: Path to the (SLOW-mode-only) master dark FITS file
         trace_dir: User trace directory (for real extensions)
         mastercalib_trace_dir: Mastercalib trace directory (for placeholder extensions)
         remove_cosmic_rays: Enable L.A.Cosmic cosmic ray removal before extraction
@@ -448,6 +472,7 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
                 output_dir=output_dir,
                 slow_bias=slow_bias,
                 fast_bias=fast_bias,
+                dark_file=dark_file,
                 trace_dir=trace_dir,
                 mastercalib_trace_dir=mastercalib_trace_dir,
                 remove_cosmic_rays=remove_cosmic_rays,
@@ -461,6 +486,7 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
             output_dir=output_dir,
             slow_bias=slow_bias,
             fast_bias=fast_bias,
+            dark_file=dark_file,
             trace_dir=trace_dir,
             mastercalib_trace_dir=mastercalib_trace_dir,
             remove_cosmic_rays=remove_cosmic_rays,
@@ -494,7 +520,8 @@ def build_edge_bias_config(config, extraction_path, flat_field_dir=None):
 
 
 def _extract_sky_frame(sky_file, extraction_path, slow_bias, fast_bias, trace_dir,
-                       remove_cosmic_rays, mask_output_dir, config, flat_pixel_maps=None):
+                       remove_cosmic_rays, mask_output_dir, config, flat_pixel_maps=None,
+                       dark_file=None):
     """Extract a dedicated blank-sky MEF and return a ``*_corrected_extractions.pkl``.
 
     Mirrors the science extraction path (validate -> optional flat-correct ->
@@ -525,6 +552,7 @@ def _extract_sky_frame(sky_file, extraction_path, slow_bias, fast_bias, trace_di
 
     extracted = run_extraction(
         sky_file, extraction_path, slow_bias=slow_bias, fast_bias=fast_bias,
+        dark_file=dark_file,
         trace_dir=trace_dir, mastercalib_trace_dir=CALIB_DIR,
         remove_cosmic_rays=remove_cosmic_rays, mask_output_dir=mask_output_dir,
         edge_bias=build_edge_bias_config(config, extraction_path))
@@ -542,9 +570,11 @@ def _extract_sky_frame(sky_file, extraction_path, slow_bias, fast_bias, trace_di
 
 
 #this isn't quite right -> nneeds checking
-def calc_wavelength_soln(arc_file, output_dir, slow_bias=None, fast_bias=None):
+def calc_wavelength_soln(arc_file, output_dir, slow_bias=None, fast_bias=None,
+                         dark_file=None):
 
     ge.GUI_extract(arc_file, output_dir=output_dir, slow_bias=slow_bias, fast_bias=fast_bias,
+                   dark_file=dark_file,
                    remove_cosmic_rays=False)
 
     arc_picklename = os.path.join(output_dir, os.path.basename(arc_file).replace('_mef.fits', '_extract.pkl'))
@@ -648,7 +678,8 @@ def resolve_twilight_files(config):
 def _process_flat_for_rss(flat_files, flat_pixel_maps, output_dir,
                           trace_dir, arc_dict_config,
                           timestamp, label='flat',
-                          slow_bias=None, fast_bias=None, edge_bias=None):
+                          slow_bias=None, fast_bias=None,
+                          dark_file=None, edge_bias=None):
     """Apply pixel flat → extract → wavelength-calibrate → generate RSS for a flat frame.
 
     Used for both dome flats (fibre-flat RSS) and twilight flats.
@@ -668,6 +699,8 @@ def _process_flat_for_rss(flat_files, flat_pixel_maps, output_dir,
         Path to SLOW-mode master bias FITS (passed to run_extraction).
     fast_bias : str or None
         Path to FAST-mode master bias FITS (passed to run_extraction).
+    dark_file : str or None
+        Path to the (SLOW-mode-only) master dark FITS (passed to run_extraction).
     trace_dir : str or None
         Directory containing fibre trace files.
     arc_dict_config : object or None
@@ -700,6 +733,7 @@ def _process_flat_for_rss(flat_files, flat_pixel_maps, output_dir,
         # run_extraction returns only a basename (from GUI_extract); join with output_dir
         pkl_basename = run_extraction(corr_file, output_dir,
                                       slow_bias=slow_bias, fast_bias=fast_bias,
+                                      dark_file=dark_file,
                                       trace_dir=trace_dir, mastercalib_trace_dir=CALIB_DIR,
                                       remove_cosmic_rays=False, edge_bias=edge_bias)
         if not pkl_basename:
@@ -1669,7 +1703,16 @@ def main(config_path):
     if fast_bias_file is None:
         logger.warning(f"Fast bias file not found at '{_fast_bias_path}' — inter-fibre fallback will be used")
 
-        
+    # Resolve the master dark file the same way. Raw dark frames are SLOW-mode
+    # only, so there is a single master dark (no fast/slow pair). Unlike bias,
+    # there is no fallback estimate — if it isn't found, dark subtraction is
+    # simply skipped (and never applied to FAST-mode frames regardless).
+    _dark_path = config.get('dark_file', DARK_FILE)
+    dark_file = _dark_path if os.path.isfile(_dark_path) else None
+    if dark_file is None:
+        logger.info(f"Master dark file not found at '{_dark_path}' — dark subtraction will be skipped")
+
+
     # Parse cosmic ray removal configuration
     remove_cosmic_rays = config.get('remove_cosmic_rays', True)
     mask_output_dir = config.get('mask_output_dir', None)
@@ -1741,12 +1784,14 @@ def main(config_path):
         print("Generating new wavelength solution.")
         logger.info("Stage: Generating new wavelength solution")
         extract_flat_field(config.get('flat_file_dir'), config.get('output_dir'),
-                           slow_bias=slow_bias_file, fast_bias=fast_bias_file)
+                           slow_bias=slow_bias_file, fast_bias=fast_bias_file,
+                           dark_file=dark_file)
         if 'arc_file' not in config:
             raise ValueError("No arc file provided in the configuration.")
         relative_throughput(config.get('shift_picklename'), config.get('flat_picklename'))
         arcdict = calc_wavelength_soln(config['arc_file'], config.get('output_dir'),
-                                       slow_bias=slow_bias_file, fast_bias=fast_bias_file)
+                                       slow_bias=slow_bias_file, fast_bias=fast_bias_file,
+                                       dark_file=dark_file)
         config['arcdict'] = arcdict
 
     else:
@@ -2063,6 +2108,7 @@ def main(config_path):
                     arc_dict_config=config.get('arcdict'),
                     timestamp=timestamp_ff, label='twilight',
                     slow_bias=slow_bias_file, fast_bias=fast_bias_file,
+                    dark_file=dark_file,
                     edge_bias=edge_bias_cfg,
                 )
                 if twi_rss:
@@ -2094,6 +2140,7 @@ def main(config_path):
                         arc_dict_config=config.get('arcdict'),
                         timestamp=timestamp_ff, label='dome',
                         slow_bias=slow_bias_file, fast_bias=fast_bias_file,
+                        dark_file=dark_file,
                         edge_bias=edge_bias_cfg,
                     )
                     if dome_rss:
@@ -2277,6 +2324,7 @@ def main(config_path):
                     extraction_path,
                     slow_bias=slow_bias_file,
                     fast_bias=fast_bias_file,
+                    dark_file=dark_file,
                     trace_dir=final_trace_dir,              # User traces
                     mastercalib_trace_dir=CALIB_DIR,        # Mastercalib fallback
                     remove_cosmic_rays=remove_cosmic_rays,
@@ -2297,6 +2345,7 @@ def main(config_path):
                 extraction_path,
                 slow_bias=slow_bias_file,
                 fast_bias=fast_bias_file,
+                dark_file=dark_file,
                 trace_dir=final_trace_dir,                  # User traces
                 mastercalib_trace_dir=CALIB_DIR,            # Mastercalib fallback
                 remove_cosmic_rays=remove_cosmic_rays,
@@ -2345,7 +2394,8 @@ def main(config_path):
                     sky_frame_files[0], extraction_path,
                     slow_bias_file, fast_bias_file, final_trace_dir,
                     remove_cosmic_rays, mask_output_dir, config,
-                    flat_pixel_maps=flat_pixel_maps if use_flat else None)
+                    flat_pixel_maps=flat_pixel_maps if use_flat else None,
+                    dark_file=dark_file)
             else:
                 print("WARNING: sky_selection_method='frame' but no sky_frame_files set; "
                       "falling back to 'dimmest'")
@@ -2551,6 +2601,7 @@ def main(config_path):
                                 slow_bias_file,
                                 extraction_path,
                                 fast_bias=fast_bias_file,
+                                dark_file=dark_file,
                                 edge_bias=edge_bias_cfg,
                             )
                             merged_primary = twi.get('primary_header',
