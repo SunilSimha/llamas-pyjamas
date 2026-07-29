@@ -168,38 +168,40 @@ def validate_pipeline_config(config: dict, config_path: str) -> bool:
     # Check packaged default locations
     for label, path in [('slow_master_bias', SLOW_BIAS_FILE),
                          ('fast_master_bias', FAST_BIAS_FILE)]:
-        if not os.path.isfile(path):
-            errors.append(
-                f"Required master bias not found: '{path}'. "
-                f"Create it from raw bias frames using BiasLlamas and place it in the Bias/ directory, "
-                f"or set 'slow_bias_file'/'fast_bias_file' in your config to a custom path."
-            )
+        bias_exists = False
+        if os.path.isfile(path):
+            bias_exists = True
+        # Check if user-supplied overrides if present
+        elif label in config and os.path.isfile(config[label]):
+            path = config[label]
+            bias_exists = True
 
-    # Check user-supplied overrides if present
-    for key in ('slow_bias_file', 'fast_bias_file'):
-        if key in config:
-            p = config[key]
-            if not os.path.isfile(p):
-                errors.append(f"'{key}' path does not exist: '{p}'")
+        if not bias_exists:
+            errors.append(  f"Required master bias not found: '{path}'. "
+                            f"Create it from raw bias frames using BiasLlamas and place it in the Bias/ directory, "
+                            f"or set 'slow_bias_file'/'fast_bias_file' in your config to a custom path."
+                        )
+
 
     # ------------------------------------------------------------------
     # 2b. Master dark file check (optional — dark subtraction is skipped,
     #     not fatal, when no master dark is available). Raw dark frames are
     #     SLOW-mode only, so there is a single master dark file.
     # ------------------------------------------------------------------
-    if not os.path.isfile(DARK_FILE):
+    dark_exists = False
+    if os.path.isfile(DARK_FILE):
+        dark_exists = True
+        dark_path = DARK_FILE
+    elif 'dark_file' in config and os.path.isfile(config['dark_file']):
+        dark_exists = True
+        dark_path = config['dark_file']  # override default for later use
+    if not dark_exists:
         warnings.append(
-            f"Master dark not found: '{DARK_FILE}'. "
+            f"Master dark not found: '{dark_path}'. "
             f"Create it from raw dark frames using DarkLlamas and place it in the Dark/ directory, "
             f"or set 'dark_file' in your config to a custom path. "
             f"Dark subtraction will be skipped where unavailable."
         )
-
-    # Check a user-supplied dark override if present — a wrong explicit path IS an error
-    if 'dark_file' in config:
-        p = config['dark_file']
-        if not os.path.isfile(p):
-            errors.append(f"'dark_file' path does not exist: '{p}'")
 
     # ------------------------------------------------------------------
     # 3. Required config keys
