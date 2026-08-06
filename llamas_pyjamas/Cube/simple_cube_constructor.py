@@ -88,6 +88,7 @@ class SimpleCubeConstructor:
         self.grid_method = grid_method
 
         # Will be loaded from RSS file
+        self.primary_header = None
         self.flux = None
         self.error = None
         self.wave = None
@@ -771,6 +772,20 @@ class SimpleCubeConstructor:
         primary.header['EXTNAME'] = 'FLUX'
         primary.header['BUNIT'] = 'counts'
         primary.header['COMMENT'] = 'LLAMAS datacube - flux'
+
+        # Propagate exposure metadata from the RSS primary header so
+        # downstream consumers (e.g. flux calibration) don't silently fall
+        # back to default exptime=1.0/airmass=1.0.
+        rexptime = self.primary_header.get('REXPTIME') if self.primary_header is not None else None
+        airmass = self.primary_header.get('AIRMASS') if self.primary_header is not None else None
+        if rexptime is None:
+            print("  WARNING: REXPTIME not found in RSS primary header; EXPTIME will be missing from cube header")
+        else:
+            primary.header['EXPTIME'] = (rexptime, 'Exposure time (s), from RSS REXPTIME')
+        if airmass is None:
+            print("  WARNING: AIRMASS not found in RSS primary header; AIRMASS will be missing from cube header")
+        else:
+            primary.header['AIRMASS'] = (airmass, 'Airmass, from RSS header')
 
         # Construction parameters
         primary.header['PIXSIZE'] = (self.pixel_size, 'Spatial pixel size (arcsec)')
