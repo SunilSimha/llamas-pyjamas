@@ -297,7 +297,7 @@ def _write_edge_qa_rows(qa_csv, science_file, primary_hdr, results):
 
 
 @ray.remote
-def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use_bias=None,
+def process_trace(hdu_data, header, trace_file, hdu_index, method='boxcar', use_bias=None,
                   use_dark=None, remove_cosmic_rays=True, edge_bias=None):
     """
     Process a single HDU: subtract bias, subtract dark current, load the trace
@@ -634,7 +634,7 @@ def compute_detector_background(data, rows=(30, 50)):
 def GUI_extract(file: fits.BinTableHDU, flatfiles: str = None, output_dir: str = None,
                 slow_bias: str = None, fast_bias: str = None,
                 dark_file: str = None,
-                method='optimal', trace_dir=None, mastercalib_trace_dir=None,
+                method='boxcar', trace_dir=None, mastercalib_trace_dir=None,
                 remove_cosmic_rays=True, mask_output_dir=None, force_refresh=False,
                 edge_bias=None) -> None:
 
@@ -665,7 +665,11 @@ def GUI_extract(file: fits.BinTableHDU, flatfiles: str = None, output_dir: str =
     slow_bias (str, optional): Path to the SLOW-mode master bias FITS file. Defaults to None.
     fast_bias (str, optional): Path to the FAST-mode master bias FITS file. Defaults to None.
     dark_file (str, optional): Path to the (SLOW-mode-only) master dark FITS file. Defaults to None.
-    method (str, optional): Extraction method ('optimal' or 'boxcar'). Defaults to 'optimal'.
+    method (str, optional): Extraction method ('optimal' or 'boxcar'). Defaults to 'boxcar'
+        (a straight, fractional-pixel trace-following aperture sum). 'optimal' now runs the
+        corrected Horne (1986) variance-weighted estimator internally (see
+        Extract/extractLlamas.py) rather than the old profile-weighted-mean formula, which
+        under-recovered flux by a factor of ~3.3x -- see redux/low_throughput_diagnosis.md.
     trace_dir (str, optional): User trace directory for real extensions. Defaults to None.
     mastercalib_trace_dir (str, optional): Mastercalib trace directory for placeholder extensions.
                                            Defaults to CALIB_DIR if None.
