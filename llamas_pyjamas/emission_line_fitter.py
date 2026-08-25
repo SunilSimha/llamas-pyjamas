@@ -234,9 +234,18 @@ def load_cube(fits_path):
         weight = hdul["WEIGHT"].data
         header = (hdul["FLUX"].header if "FLUX" in hdul else hdul[0].header).copy()
 
-    # header stores CRVAL3/CDELT3 in meters -- convert to Angstrom
+    # header stores the spectral axis in meters -- read the TRUE effective
+    # step via pixel_scale_matrix (not a raw CDELT3 dict lookup): a raw cube
+    # encodes it as a bare CDELT3, but an astrometry-corrected cube (see
+    # astrometry_correction._build_cube_wcs3d) has it split across a
+    # vestigial CDELT3=1.0 and the real value in PC3_3 -- to_header() always
+    # round-trips a CD-matrix WCS through the PC+CDELT convention.
+    # pixel_scale_matrix resolves either convention correctly.
+    cdelt3_m = WCS(header).pixel_scale_matrix[2, 2]
     header["CRVAL3"] = header["CRVAL3"] * 1e10
-    header["CDELT3"] = header["CDELT3"] * 1e10
+    header["CDELT3"] = cdelt3_m * 1e10
+    for k in ("PC3_1", "PC3_2", "PC3_3", "PC1_3", "PC2_3", "CD3_1", "CD3_2", "CD3_3", "CD1_3", "CD2_3"):
+        header.pop(k, None)
     header["CUNIT3"] = "Angstrom"
     wcs = WCS(header)
 
@@ -351,7 +360,10 @@ def _cube_wave_bounds(fits_path):
     nwave = header["NAXIS3"]
     crpix3 = header.get("CRPIX3", 1.0)
     crval3 = header["CRVAL3"] * 1e10
-    cdelt3 = header["CDELT3"] * 1e10
+    # See load_cube's docstring comment: read the true spectral step via
+    # pixel_scale_matrix, not a raw CDELT3 lookup, so this also works for an
+    # astrometry-corrected cube's header.
+    cdelt3 = WCS(header).pixel_scale_matrix[2, 2] * 1e10
     w0 = crval3 + (1 - crpix3) * cdelt3
     w1 = crval3 + (nwave - crpix3) * cdelt3
     return (w0, w1) if w0 <= w1 else (w1, w0)
@@ -784,24 +796,35 @@ def group_wave_window(group_lines, z, pad):
     return min(obs) - pad, max(obs) + pad
 
 
-def build_model(line_names, tie_doublets, sigma_fixed=None):
+def build_model(line_names, tie_doublets, sigma_fixed=None, poly_order=1,
+                 wave_ref=0.0, wave_scale=1.0):
     """
     Build a model function for a set of lines, ALL sharing the same single
     `sigma` (one line width per complex) and the same `z` (one redshift per
-    complex).
+    complex), on top of a degree-`poly_order` continuum polynomial in
+    x = (wave - wave_ref) / wave_scale (default poly_order=1 reproduces the
+    original linear continuum: cont0 + cont1*x).
 
     By default (sigma_fixed=None) sigma is a free fit parameter:
-    model(wave, z, cont0, cont1, sigma, *free_amps, *ratios). When
+    model(wave, z, *cont_coeffs, sigma, *free_amps, *ratios). When
     sigma_fixed is given, sigma is NOT a fit parameter at all -- it's baked
     into the model as a constant, and the returned model_fn instead takes
-    model(wave, z, cont0, cont1, *free_amps, *ratios) -- a genuinely smaller
+    model(wave, z, *cont_coeffs, *free_amps, *ratios) -- a genuinely smaller
     parameter vector, not just a tightly bounded one. This is how fit_cube
     holds sigma fixed at a per-group value determined once from the
     brightest spaxels (see determine_group_sigma) rather than re-fitting it
     independently (and un-constrainedly) at every spaxel -- this dataset's
     spectral resolution doesn't resolve any intrinsic line width, so sigma is
     purely instrumental+atmospheric and has no business varying spaxel to
-    spaxel.
+    spaxel. cont_coeffs has poly_order+1 entries, increasing power order
+    (numpy.polynomial.polynomial convention): cont0 + cont1*x + cont2*x**2 +
+    ... -- see fit_continuum_polynomial for the matching stage-A pre-fit
+    that seeds these as fit_spaxel's initial guess.
+
+    wave_ref/wave_scale are fixed by the caller rather than recomputed from
+    whatever wave array a given model_fn call happens to receive, so a
+    stage-A continuum-only pre-fit (fit_continuum_polynomial) and this
+    function's joint fit agree on the same x basis.
 
     When tie_doublets is True, a fixed-atomic-ratio doublet's weak member (if
     present in line_names) is not given its own free amplitude; its flux is
@@ -839,10 +862,15 @@ def build_model(line_names, tie_doublets, sigma_fixed=None):
                    if name in RATIO_BOUNDS and RATIO_BOUNDS[name][0] in free_lines]
     free_lines = [name for name in free_lines if name not in ratio_lines]
 
-    def _flux(wave, z, cont0, cont1, sigma, params):
+    n_cont = poly_order + 1
+
+    def _flux(wave, z, cont_coeffs, sigma, params):
         amp_of = dict(zip(free_lines, params[:len(free_lines)]))
         ratio_of = dict(zip(ratio_lines, params[len(free_lines):]))
-        flux = cont0 + cont1 * (wave - wave.mean())
+        x = (wave - wave_ref) / wave_scale
+        flux = np.zeros_like(wave, dtype=float)
+        for k, c in enumerate(cont_coeffs):
+            flux = flux + c * x ** k
         for name in line_names:
             if name in derived:
                 strong, ratio = derived[name]
@@ -856,13 +884,54 @@ def build_model(line_names, tie_doublets, sigma_fixed=None):
         return flux
 
     if sigma_fixed is None:
-        def model_fn(wave, z, cont0, cont1, sigma, *params):
-            return _flux(wave, z, cont0, cont1, sigma, params)
+        def model_fn(wave, z, *rest):
+            cont_coeffs, sigma, params = rest[:n_cont], rest[n_cont], rest[n_cont + 1:]
+            return _flux(wave, z, cont_coeffs, sigma, params)
     else:
-        def model_fn(wave, z, cont0, cont1, *params):
-            return _flux(wave, z, cont0, cont1, sigma_fixed, params)
+        def model_fn(wave, z, *rest):
+            cont_coeffs, params = rest[:n_cont], rest[n_cont:]
+            return _flux(wave, z, cont_coeffs, sigma_fixed, params)
 
     return model_fn, free_lines, derived, ratio_lines
+
+
+def fit_continuum_polynomial(wave, flux, var, group_lines, z, sigma_for_mask, poly_order,
+                              wave_ref, wave_scale, mask_halfwidth_sigma=4.0):
+    """
+    Stage-A pre-fit: robust weighted-linear-least-squares polynomial fit to
+    the continuum ALONE, with every line in group_lines masked out (+/-
+    mask_halfwidth_sigma * sigma_for_mask around its redshifted center).
+    wave/flux/var are assumed already restricted to finite, good pixels
+    within the group's fit window (see fit_spaxel) -- this function only
+    additionally excludes the line windows.
+
+    Used solely to seed fit_spaxel's stage-B joint (continuum+lines)
+    curve_fit with a good initial guess for the continuum coefficients --
+    stage B still refits them freely alongside the lines, so this is not the
+    final continuum solution. Doing this in two stages (rather than seeding
+    the joint fit with a flat guess, as before) matters once poly_order > 1:
+    curve_fit's local optimizer can otherwise settle on a poor local minimum
+    for the higher-order terms, especially at lower S/N.
+
+    Returns poly_order+1 coefficients in the SAME (wave-wave_ref)/wave_scale
+    basis build_model's continuum uses (increasing power order). Falls back
+    to a flat (median-level) guess if too few continuum pixels remain after
+    masking out the lines.
+    """
+    line_centers = [LINES[name] * (1 + z) for name in group_lines]
+    line_mask = np.zeros(wave.shape, dtype=bool)
+    for c in line_centers:
+        line_mask |= np.abs(wave - c) <= mask_halfwidth_sigma * sigma_for_mask
+    cont_only = ~line_mask
+
+    coeffs = np.zeros(poly_order + 1)
+    if cont_only.sum() < poly_order + 2:
+        coeffs[0] = np.median(flux) if flux.size else 0.0
+        return coeffs
+
+    x = (wave[cont_only] - wave_ref) / wave_scale
+    lsq_weights = 1.0 / np.sqrt(var[cont_only])
+    return np.polynomial.polynomial.polyfit(x, flux[cont_only], poly_order, w=lsq_weights)
 
 
 # ----------------------------------------------------------------------
@@ -870,7 +939,7 @@ def build_model(line_names, tie_doublets, sigma_fixed=None):
 # ----------------------------------------------------------------------
 def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
                sigma_bounds, tie_doublets, window_pad=60.0, min_good_pix=10,
-               sigma_fixed=None):
+               sigma_fixed=None, poly_order=3, continuum_mask_halfwidth_sigma=4.0):
     """
     Fit one spaxel's spectrum for a given line group.
 
@@ -881,8 +950,23 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
     same call site can be reused for a free-sigma pre-fit (sigma_fixed
     omitted) and the main, sigma-held-fixed fitting pass (see fit_cube).
 
+    The continuum is a degree-poly_order polynomial (default 3, i.e. cubic --
+    a plain linear continuum (poly_order=1) systematically failed to track
+    real curvature/slope even at high S/N, confirmed by eye against the
+    halpha_nii complex's own per-spaxel fit diagnostics). Fitting proceeds in
+    two stages: (a) fit_continuum_polynomial fits the continuum ALONE to the
+    line-masked pixels (+/- continuum_mask_halfwidth_sigma * sigma around
+    each line), (b) that result seeds the initial guess for the full joint
+    (continuum + lines) curve_fit below, which still refits every continuum
+    coefficient freely -- stage A only prevents the joint optimizer from
+    settling on a poor local minimum for the higher-order terms, it is not
+    itself the final continuum.
+
     Returns a dict with keys: 'amp', 'amp_err' (dict per line in group_lines),
-    'sigma', 'z', 'chi2_reduced', 'success'.
+    'sigma', 'z', 'cont0'/'cont1' (first two continuum coefficients, kept for
+    backward compatibility), 'cont_coeffs'/'cont_coeffs_err' (all poly_order+1
+    coefficients and their errors), 'wave_ref'/'wave_scale' (the continuum's
+    x-basis, needed to evaluate cont_coeffs), 'chi2_reduced', 'success'.
     """
     result = {
         "amp": {name: np.nan for name in group_lines},
@@ -893,6 +977,10 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
         "cont0_err": np.nan,
         "cont1": np.nan,
         "cont1_err": np.nan,
+        "cont_coeffs": None,
+        "cont_coeffs_err": None,
+        "wave_ref": np.nan,
+        "wave_scale": np.nan,
         "chi2_reduced": np.nan,
         "success": False,
     }
@@ -914,22 +1002,30 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
     w, f, v = w[good], f[good], v[good]
     sigma_y = np.sqrt(v)
 
-    model_fn, free_lines, derived, ratio_lines = build_model(group_lines, tie_doublets,
-                                                              sigma_fixed=sigma_fixed)
-    n_amp, n_ratio = len(free_lines), len(ratio_lines)
-    n_lead = 3 if sigma_fixed is not None else 4
+    n_cont = poly_order + 1
+    wave_ref = float(w.mean())
+    wave_scale = max(0.5 * float(w.max() - w.min()), 1e-6)
+    sigma_for_mask = sigma_fixed if sigma_fixed is not None else sigma_init
+    cont_p0 = fit_continuum_polynomial(w, f, v, group_lines, z, sigma_for_mask, poly_order,
+                                        wave_ref, wave_scale,
+                                        mask_halfwidth_sigma=continuum_mask_halfwidth_sigma)
 
-    cont_guess = np.median(f)
+    model_fn, free_lines, derived, ratio_lines = build_model(
+        group_lines, tie_doublets, sigma_fixed=sigma_fixed, poly_order=poly_order,
+        wave_ref=wave_ref, wave_scale=wave_scale)
+    n_amp, n_ratio = len(free_lines), len(ratio_lines)
+    n_lead = 1 + n_cont + (1 if sigma_fixed is None else 0)
+
     # Ratio params start at 1.0 -- a neutral, roughly-central guess within
     # every RATIO_BOUNDS pair's [lo, hi] (both are currently [0.35, 1.5]).
     if sigma_fixed is None:
-        lead_p0 = [z, cont_guess, 0.0, sigma_init]
-        lead_lower = [z - dz_max, -np.inf, -np.inf, sigma_bounds[0]]
-        lead_upper = [z + dz_max, np.inf, np.inf, sigma_bounds[1]]
+        lead_p0 = [z] + list(cont_p0) + [sigma_init]
+        lead_lower = [z - dz_max] + [-np.inf] * n_cont + [sigma_bounds[0]]
+        lead_upper = [z + dz_max] + [np.inf] * n_cont + [sigma_bounds[1]]
     else:
-        lead_p0 = [z, cont_guess, 0.0]
-        lead_lower = [z - dz_max, -np.inf, -np.inf]
-        lead_upper = [z + dz_max, np.inf, np.inf]
+        lead_p0 = [z] + list(cont_p0)
+        lead_lower = [z - dz_max] + [-np.inf] * n_cont
+        lead_upper = [z + dz_max] + [np.inf] * n_cont
 
     p0 = lead_p0 + [max(np.ptp(f), 1.0)] * n_amp + [1.0] * n_ratio
     lower = lead_lower + [0.0] * n_amp + [RATIO_BOUNDS[name][1] for name in ratio_lines]
@@ -947,10 +1043,12 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
         return result
 
     perr = np.sqrt(np.diag(pcov))
+    z_fit = popt[0]
+    cont_fit = popt[1:1 + n_cont]
+    cont_err = perr[1:1 + n_cont]
     if sigma_fixed is None:
-        z_fit, cont0_fit, cont1_fit, sigma_fit = popt[:4]
+        sigma_fit = popt[1 + n_cont]
     else:
-        z_fit, cont0_fit, cont1_fit = popt[:3]
         sigma_fit = sigma_fixed
     amp_idx = {name: n_lead + i for i, name in enumerate(free_lines)}
     ratio_idx = {name: n_lead + n_amp + j for j, name in enumerate(ratio_lines)}
@@ -985,10 +1083,14 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
     dof = max(len(w) - len(popt), 1)
     result["sigma"] = sigma_fit
     result["z"] = z_fit
-    result["cont0"] = cont0_fit
-    result["cont0_err"] = perr[1]
-    result["cont1"] = cont1_fit
-    result["cont1_err"] = perr[2]
+    result["cont0"] = cont_fit[0]
+    result["cont0_err"] = cont_err[0]
+    result["cont1"] = cont_fit[1] if n_cont > 1 else 0.0
+    result["cont1_err"] = cont_err[1] if n_cont > 1 else 0.0
+    result["cont_coeffs"] = cont_fit
+    result["cont_coeffs_err"] = cont_err
+    result["wave_ref"] = wave_ref
+    result["wave_scale"] = wave_scale
     result["chi2_reduced"] = np.sum((resid / sigma_y) ** 2) / dof
     result["success"] = True
     return result
@@ -1020,7 +1122,8 @@ def select_topk_by_snr(fit_mask, snr_image, topk_frac=0.05, min_topk=1):
 
 
 def determine_group_sigma(wave, flux, var, weight, avail, z, dz_max, sigma_init,
-                           sigma_bounds, tie_doublets, window_pad, topk_iy, topk_ix):
+                           sigma_bounds, tie_doublets, window_pad, topk_iy, topk_ix,
+                           poly_order=3, continuum_mask_halfwidth_sigma=4.0):
     """
     Free-sigma pre-fit at each (topk_iy[k], topk_ix[k]) spaxel individually
     (via fit_spaxel with sigma_fixed=None, i.e. the ordinary free-sigma
@@ -1038,7 +1141,8 @@ def determine_group_sigma(wave, flux, var, weight, avail, z, dz_max, sigma_init,
     for iy, ix in zip(topk_iy, topk_ix):
         res = fit_spaxel(wave, flux[:, iy, ix], var[:, iy, ix], weight[:, iy, ix],
                           avail, z, dz_max, sigma_init, sigma_bounds, tie_doublets,
-                          window_pad=window_pad)
+                          window_pad=window_pad, poly_order=poly_order,
+                          continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma)
         if res["success"]:
             sigma_values.append(res["sigma"])
     sigma_values = np.array(sigma_values, dtype=float)
@@ -1117,7 +1221,8 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
              target_name=None, window_pad=60.0,
              continuum_wave_min=6400.0, continuum_wave_max=6700.0,
              wave_range=None, include_continuum=True,
-             mad_sigma=2.5, narrowband_pad=30.0, sigma_topk_frac=0.05, sigma_topk_min=1):
+             mad_sigma=2.5, narrowband_pad=30.0, sigma_topk_frac=0.05, sigma_topk_min=1,
+             continuum_poly_order=3, continuum_mask_halfwidth_sigma=4.0):
     """
     Fit all line complexes (LINE_GROUPS) in one LLAMAS channel cube, plus
     (optionally) a broadband continuum image (see compute_broadband_continuum).
@@ -1253,7 +1358,9 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
                                                min_topk=sigma_topk_min)
         sigma_fixed, sigma_values = determine_group_sigma(
             wave, flux, var, weight, avail, z, dz_max, sigma_init, sigma_bounds,
-            tie_doublets, window_pad, topk_iy, topk_ix)
+            tie_doublets, window_pad, topk_iy, topk_ix,
+            poly_order=continuum_poly_order,
+            continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma)
         if sigma_fixed is None:
             print(f"[{group_name}] no successful top-S/N pre-fits, skipping group")
             continue
@@ -1276,6 +1383,8 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
                 wave, flux[:, iy, ix], var[:, iy, ix], weight[:, iy, ix],
                 avail, z, dz_max, sigma_init, sigma_bounds, tie_doublets,
                 window_pad=window_pad, sigma_fixed=sigma_fixed,
+                poly_order=continuum_poly_order,
+                continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
             )
             if not res["success"]:
                 continue
@@ -1368,7 +1477,8 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
                 tie_doublets=True, dv_max_kms=300.0, outdir=".", target_name=None,
                 window_pad=60.0, continuum_channel=None,
                 continuum_wave_min=6400.0, continuum_wave_max=6700.0,
-                mad_sigma=2.5, narrowband_pad=30.0, sigma_topk_frac=0.05, sigma_topk_min=1):
+                mad_sigma=2.5, narrowband_pad=30.0, sigma_topk_frac=0.05, sigma_topk_min=1,
+                continuum_poly_order=3, continuum_mask_halfwidth_sigma=4.0):
     """
     Fit emission lines across one or more LLAMAS channel cubes (blue/green/
     red) for a single target and merge the results into one maps dict
@@ -1441,6 +1551,8 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
             wave_range=wave_range, include_continuum=False,
             mad_sigma=mad_sigma, narrowband_pad=narrowband_pad,
             sigma_topk_frac=sigma_topk_frac, sigma_topk_min=sigma_topk_min,
+            continuum_poly_order=continuum_poly_order,
+            continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
         )
 
     merged = merge_channel_maps(per_channel_maps)
