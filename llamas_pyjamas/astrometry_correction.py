@@ -84,7 +84,10 @@ from astropy.stats import sigma_clipped_stats
 from astropy.visualization import ImageNormalize, LogStretch, LinearStretch
 from astropy.modeling import models, fitting
 from astropy.stats import gaussian_sigma_to_fwhm
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 from scipy.signal import correlate2d
+from scipy.ndimage import label as _ndi_label
 from reproject import reproject_interp
 import matplotlib.pyplot as plt
 
@@ -323,6 +326,176 @@ def _mask_background_pixels(image_2d, sigma_multiplier=3.0):
     return masked
 
 
+def find_calibrator_sources(reference_data, reference_wcs, exclude_coord,
+                             exclude_radius_arcsec=5.0, sigma_threshold=8.0, min_npix=3):
+    """
+    Auto-detect compact, well-separated sources in a reference image, for
+    use as orientation calibrators (see score_orientation_candidate):
+    predicting where such a source SHOULD land under a candidate
+    flip/rotate transform, then checking whether the cube's own continuum
+    image actually shows something there, is a much better test of parity
+    (mirror/chirality) than correlating the target alone -- a single,
+    roughly-symmetric blob's correlation peak is nearly invariant under
+    reflection about its own centroid, so it can't reliably discriminate a
+    mirrored solution from a correct one; a second, spatially offset source
+    can (confirmed empirically this session: for one target, an unrelated
+    field star 12.9" from the target showed a flipped East-West sign under
+    a wrong-parity transform, while the target itself -- a close QSO+galaxy
+    blend too tight to resolve independently -- gave no such signal).
+
+    MAD-based threshold (same recipe as _mask_background_pixels) ->
+    scipy.ndimage.label connected components -> flux-weighted centroid per
+    blob -> convert to a SkyCoord via reference_wcs.pixel_to_world -> drop
+    anything within exclude_radius_arcsec of exclude_coord (the QSO/target
+    region itself, handled separately).
+
+    min_npix drops single/few-pixel detections (default: require at least
+    3 connected pixels) -- a 1-pixel, marginal-significance blip is cheap
+    noise that can spuriously "confirm" at nearly the same score under
+    every candidate orientation (confirmed this session: a 1-pixel, 8-sigma
+    blip tied all 8 dihedral candidates at an identical score, masking the
+    real discriminating signal from a genuine 20-pixel calibrator).
+
+    Returns a list of dicts (sorted by distance from exclude_coord,
+    descending -- farther is a better lever arm for parity discrimination):
+    {'coord': SkyCoord, 'peak_significance': float, 'npix': int,
+    'distance_arcsec': float}. Empty list if nothing qualifies.
+    """
+    finite = np.isfinite(reference_data)
+    if not np.any(finite):
+        return []
+    med = float(np.nanmedian(reference_data[finite]))
+    mad = float(np.nanmedian(np.abs(reference_data[finite] - med)))
+    sigma = 1.4826 * mad
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = float(np.nanstd(reference_data[finite]))
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        return []
+
+    sig_map = np.where(finite, (reference_data - med) / sigma, -np.inf)
+    labeled, n = _ndi_label(sig_map > sigma_threshold)
+
+    calibrators = []
+    for i in range(1, n + 1):
+        ys, xs = np.where(labeled == i)
+        if len(ys) < min_npix:
+            continue
+        w = reference_data[ys, xs] - med
+        if not np.any(w > 0):
+            continue
+        cy = float(np.average(ys, weights=w))
+        cx = float(np.average(xs, weights=w))
+        coord = reference_wcs.pixel_to_world(cx, cy)
+        dist_arcsec = coord.separation(exclude_coord).arcsec
+        if dist_arcsec <= exclude_radius_arcsec:
+            continue
+        calibrators.append(dict(
+            coord=coord, peak_significance=float(sig_map[ys, xs].max()),
+            npix=int(len(ys)), distance_arcsec=dist_arcsec,
+        ))
+    calibrators.sort(key=lambda c: c["distance_arcsec"], reverse=True)
+    return calibrators
+
+
+def score_orientation_candidate(flipped_cont_data, flipped_cont_wcs, calibrators,
+                                 aperture_radius_arcsec=5.0, sigma_threshold=5.0):
+    """
+    Score how well a candidate (flip_axis, rotate_ccw_deg)'s resulting,
+    fully-corrected continuum map explains the calibrator sources found by
+    find_calibrator_sources: for each calibrator, predict its pixel position
+    under flipped_cont_wcs (world_to_pixel), and check whether the
+    (UNMASKED) continuum data actually shows a locally significant peak
+    there -- small-aperture peak flux compared to the whole array's own
+    MAD-based background level/sigma. aperture_radius_arcsec defaults to
+    5.0" (not e.g. 1.5", the FWHM-scale aperture that would be appropriate
+    for a converged, already-precise position) since the "predicted"
+    position here stacks several independent sources of slop -- the seed
+    coordinate itself, refine_point_source_coord's own fit uncertainty, and
+    this specific candidate's own stage-2/stage-3 registration residual
+    (which can itself run to several arcsec, especially for a WRONG-parity
+    candidate that never truly converges) -- confirmed empirically this
+    session: a real, 20-pixel calibrator detection was missed entirely at
+    1.5" (0.18 sigma local peak) but stood out clearly at 5" (9.0 sigma),
+    cleanly separated from every other candidate's <5.1 sigma.
+
+    Returns (score, n_confirmed, details): score is the significance-
+    weighted sum of confirmed calibrators (so a strong, distant calibrator
+    counts more than a marginal one) -- the primary, parity-sensitive
+    ranking signal for auto_correct_target. n_confirmed is a plain count,
+    for reporting. details is a per-calibrator list of dicts (coord,
+    predicted pixel, local significance, confirmed bool) for diagnostics.
+    """
+    ny, nx = flipped_cont_data.shape
+    finite = np.isfinite(flipped_cont_data)
+    details = []
+    if not np.any(finite) or not calibrators:
+        return 0.0, 0, details
+
+    med = float(np.nanmedian(flipped_cont_data[finite]))
+    mad = float(np.nanmedian(np.abs(flipped_cont_data[finite] - med)))
+    bg_sigma = 1.4826 * mad
+    if not np.isfinite(bg_sigma) or bg_sigma <= 0.0:
+        bg_sigma = float(np.nanstd(flipped_cont_data[finite]))
+
+    pix_scale_arcsec = float(np.nanmean(proj_plane_pixel_scales(flipped_cont_wcs))) * 3600.0
+    aperture_radius_pix = aperture_radius_arcsec / pix_scale_arcsec
+    yy, xx = np.indices((ny, nx))
+
+    score, n_confirmed = 0.0, 0
+    for cal in calibrators:
+        px, py = flipped_cont_wcs.world_to_pixel(cal["coord"])
+        if not (np.isfinite(px) and np.isfinite(py) and 0 <= px < nx and 0 <= py < ny):
+            details.append(dict(coord=cal["coord"], pixel=(px, py), local_sig=np.nan,
+                                 confirmed=False, off_array=True))
+            continue
+        aperture = np.hypot(xx - px, yy - py) <= aperture_radius_pix
+        aperture_vals = flipped_cont_data[aperture & finite]
+        confirmed = False
+        local_sig = np.nan
+        if aperture_vals.size > 0 and np.isfinite(bg_sigma) and bg_sigma > 0.0:
+            local_sig = (float(np.nanmax(aperture_vals)) - med) / bg_sigma
+            confirmed = local_sig >= sigma_threshold
+        if confirmed:
+            score += cal["peak_significance"]
+            n_confirmed += 1
+        details.append(dict(coord=cal["coord"], pixel=(px, py), local_sig=local_sig,
+                             confirmed=confirmed, off_array=False))
+    return score, n_confirmed, details
+
+
+def _mask_disk(image_2d, wcs, radius_arcsec, center_coord=None, keep_inside=False):
+    """
+    Set pixels either INSIDE (keep_inside=False, the default -- an
+    "exclusion" disk, e.g. for a bright point-source contaminant) or OUTSIDE
+    (keep_inside=True -- an "inclusion"/restrict-to-disk mask, e.g. for
+    restricting a search to near the known pointing) a circular disk of
+    radius_arcsec to NaN.
+
+    center_coord: an astropy SkyCoord to center the disk on, converted to
+    image_2d's own pixel grid via wcs.world_to_pixel -- same pattern as
+    emission_line_fitter.load_halpha_peak_fraction_mask/
+    _localization_ellipse_patch. Defaults to None, meaning the array's OWN
+    geometric pixel center ((nx-1)/2, (ny-1)/2) -- identical to
+    _mask_center_disk's original hardcoded behavior, valid whenever the
+    array being masked (a reference cutout built centered on the target, or
+    a flip/rotated LLAMAS array whose telescope pointing was centered on/
+    near the true target) is itself centered on/near the position of
+    interest.
+    """
+    ny, nx = image_2d.shape
+    pix_scale_arcsec = float(np.nanmean(proj_plane_pixel_scales(wcs))) * 3600.0
+    radius_pix = radius_arcsec / pix_scale_arcsec
+    if center_coord is None:
+        cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
+    else:
+        cx, cy = wcs.world_to_pixel(center_coord)
+    yy, xx = np.indices((ny, nx))
+    inside = np.hypot(xx - cx, yy - cy) <= radius_pix
+    masked = np.array(image_2d, dtype=np.float32, copy=True)
+    masked[~inside if keep_inside else inside] = np.nan
+    return masked
+
+
 def _mask_center_disk(image_2d, wcs, radius_arcsec):
     """
     Set pixels within radius_arcsec of the array's own geometric center to
@@ -333,17 +506,12 @@ def _mask_center_disk(image_2d, wcs, radius_arcsec):
     being pulled toward a feature that structurally cannot appear in the line
     map at all. Valid because reference cutouts here are built centered
     exactly on the target coordinate (see default_reference_path/get_image
-    usage), so the array's geometric center IS the target center.
+    usage), so the array's geometric center IS the target center. Thin
+    wrapper around _mask_disk (center_coord=None, keep_inside=False) --
+    kept as a stable name since cross_correlate_to_reference's
+    mask_center_radius_arcsec already calls this directly.
     """
-    ny, nx = image_2d.shape
-    pix_scale_arcsec = float(np.nanmean(proj_plane_pixel_scales(wcs))) * 3600.0
-    radius_pix = radius_arcsec / pix_scale_arcsec
-    yy, xx = np.indices((ny, nx))
-    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
-    disk = np.hypot(xx - cx, yy - cy) <= radius_pix
-    masked = np.array(image_2d, dtype=np.float32, copy=True)
-    masked[disk] = np.nan
-    return masked
+    return _mask_disk(image_2d, wcs, radius_arcsec)
 
 
 def _safe_mask_background(image_2d, sigma_multiplier):
@@ -552,9 +720,19 @@ def measure_continuum_centroid(cont_data, bg_sigma_thresholds=(5.0, 3.0)):
     bg_sigma_used (float or None), x0_pix/y0_pix (0-indexed pixel coords of
     cont_data), fwhm_x_pix/fwhm_y_pix, fwhm_eff_pix (geometric mean, used for
     the search-window radius), amplitude, model (None for the moment fallback).
+
+    Thin wrapper around _fit_2d_centroid -- see that function for the actual
+    fit implementation, shared with refine_point_source_coord.
     """
-    ny, nx = cont_data.shape
-    masked, bg_sigma_used = _mask_background_with_fallback(cont_data, bg_sigma_thresholds)
+    return _fit_2d_centroid(cont_data, bg_sigma_thresholds)
+
+
+def _fit_2d_centroid(data_2d, bg_sigma_thresholds=(5.0, 3.0)):
+    """Fit implementation extracted from measure_continuum_centroid (see its
+    docstring for the algorithm) -- reused as-is by refine_point_source_coord
+    to centroid a small windowed-out region instead of a whole continuum map."""
+    ny, nx = data_2d.shape
+    masked, bg_sigma_used = _mask_background_with_fallback(data_2d, bg_sigma_thresholds)
     yy, xx = np.mgrid[0:ny, 0:nx]
     finite = np.isfinite(masked)
 
@@ -612,6 +790,32 @@ def measure_continuum_centroid(cont_data, bg_sigma_thresholds=(5.0, 3.0)):
         fwhm_eff_pix=float(np.sqrt(fwhm_x * fwhm_y)),
         amplitude=float(fit_model.amplitude.value), model=fit_model,
     )
+
+
+def refine_point_source_coord(reference_data, reference_wcs, seed_coord,
+                               search_radius_arcsec=3.0, bg_sigma_thresholds=(5.0, 3.0)):
+    """
+    Refine a rough catalog sky coordinate (seed_coord -- e.g. a quasar's
+    literature RA/Dec) into a precise centroid on a TRUSTED reference image
+    (e.g. a Pan-STARRS cutout): restrict to a small disk of
+    search_radius_arcsec around seed_coord (_mask_disk, keep_inside=True),
+    then reuse _fit_2d_centroid -- the identical MAD-background-cut +
+    2D-Gaussian-fit-with-moment-fallback recipe measure_continuum_centroid
+    uses, so the two stay consistent.
+
+    This is a SMALL LOCAL refinement of an already-approximately-known
+    position, not a general multi-source detector: it will happily converge
+    on the locally brightest thing within search_radius_arcsec, so keep that
+    tight relative to how good seed_coord already is.
+
+    Returns a dict: everything _fit_2d_centroid returns, plus 'coord' (a
+    SkyCoord, or None if the fit failed) in reference_data's own frame.
+    """
+    windowed = _mask_disk(reference_data, reference_wcs, search_radius_arcsec,
+                           center_coord=seed_coord, keep_inside=True)
+    fit = _fit_2d_centroid(windowed, bg_sigma_thresholds)
+    coord = reference_wcs.pixel_to_world(fit["x0_pix"], fit["y0_pix"]) if fit["success"] else None
+    return dict(fit, coord=coord)
 
 
 def plot_continuum_centroid_diagnostic(cont_data, cont_wcs, centroid, target_name, out_path,
@@ -813,7 +1017,8 @@ def correct_cube(cube_path, corrected_linemaps_path, outdir=None, cube_label="gr
 # ----------------------------------------------------------------------
 def plot_alignment_diagnostic(reference_data, reference_wcs, line_data, corrected_line_wcs,
                                target_name, line_name, out_path,
-                               contour_sigma_multiples=(3, 6, 14, 30, 65, 140, 300)):
+                               contour_sigma_multiples=(3, 6, 14, 30, 65, 140, 300),
+                               vmin_sigma_floor=10.0, qso_coord=None):
     # Display-only reprojection: the reference image on disk may not be
     # North-up/East-left (see _display_orientation_wcs) even though its WCS
     # correctly records whatever orientation it actually has. Statistics
@@ -825,18 +1030,23 @@ def plot_alignment_diagnostic(reference_data, reference_wcs, line_data, correcte
     fig, ax = plt.subplots(figsize=(7, 7), subplot_kw={"projection": display_wcs})
     _, ref_med, ref_std = sigma_clipped_stats(reference_data, sigma=3.0)
     vmax = float(np.nanmax(reference_data))
-    # Log stretch with a floor well above the background level (LogStretch needs
-    # positive values) so the smooth diffuse galaxy light is mostly clipped out,
-    # and vmax near the image peak, to reveal bright structure instead of a
-    # smooth blob. The floor is capped at half the image's actual peak
-    # significance: a fixed 10-sigma floor works for a high-contrast reference
-    # (e.g. a bright galaxy core well above background) but can exceed vmax
-    # entirely for a fainter/lower-contrast one (confirmed for FRB20250227A's
-    # g-band cutout, peak only ~9.5 sigma above background) -- ImageNormalize
-    # requires vmin < vmax, so this keeps the floor meaningful instead of
-    # erroring or silently degrading to a near-empty display.
+    # Log stretch with a floor above the background level (LogStretch needs
+    # positive values), vmax near the image peak. A higher vmin_sigma_floor
+    # clips more of the smooth diffuse galaxy light, revealing bright compact
+    # structure instead of a smooth blob; a lower one keeps more of the
+    # extended, fainter light visible at the cost of some background noise
+    # texture -- the right choice depends on whether you're checking gross
+    # alignment against faint extended structure or fine alignment against a
+    # bright compact feature. The floor is capped at half the image's actual
+    # peak significance: a fixed high floor (e.g. 10 sigma) works for a
+    # high-contrast reference (e.g. a bright galaxy core well above
+    # background) but can exceed vmax entirely for a fainter/lower-contrast
+    # one (confirmed for FRB20250227A's g-band cutout, peak only ~9.5 sigma
+    # above background) -- ImageNormalize requires vmin < vmax, so this keeps
+    # the floor meaningful instead of erroring or silently degrading to a
+    # near-empty display.
     peak_sigma = (vmax - ref_med) / ref_std if ref_std > 0 else 10.0
-    floor_sigma = min(10.0, 0.5 * peak_sigma) if peak_sigma > 0 else 1.0
+    floor_sigma = min(vmin_sigma_floor, 0.5 * peak_sigma) if peak_sigma > 0 else 1.0
     vmin = ref_med + floor_sigma * ref_std
     norm = ImageNormalize(stretch=LogStretch(), vmin=vmin, vmax=vmax)
     ax.imshow(display_data, origin="lower", cmap="Greys_r", norm=norm)
@@ -844,8 +1054,33 @@ def plot_alignment_diagnostic(reference_data, reference_wcs, line_data, correcte
     _, med, std = sigma_clipped_stats(line_data, sigma=3.0)
     levels = sorted(med + n * std for n in contour_sigma_multiples)
     plot_data = np.where(np.isfinite(line_data), line_data, -np.inf)
-    ax.contour(plot_data, levels=levels, transform=ax.get_transform(corrected_line_wcs),
-               colors="red", linewidths=1.0)
+    # Drop any level with no pixel reaching it before calling ax.contour: astropy's
+    # WCS contour transform (transform_contour_set_inplace) raises an IndexError on
+    # a fully-empty contour collection rather than just drawing nothing, and a
+    # per-spaxel fit-flux map (mostly hard zeros outside its own narrowband fit
+    # mask, real signal only in a small compact population) can push
+    # sigma_clipped_stats' std well above the map's actual peak for a faint
+    # target -- confirmed for FRB20211127I's Hbeta map, where even the lowest
+    # (3-sigma) level had zero qualifying pixels. Skip contouring entirely (with
+    # a warning) if every level is empty, rather than crashing the whole plot.
+    levels = [lv for lv in levels if np.any(plot_data >= lv)]
+    if levels:
+        ax.contour(plot_data, levels=levels, transform=ax.get_transform(corrected_line_wcs),
+                   colors="red", linewidths=1.0)
+    else:
+        warnings.warn(f"[{target_name}] {line_name}: no contour level has any qualifying pixel "
+                       "(map too faint/sparse relative to contour_sigma_multiples); skipping contours")
+
+    if qso_coord is not None:
+        # Plotted directly in the sky/world frame (get_transform("world")), so this
+        # is correct regardless of display_wcs's own reprojection -- an at-a-glance
+        # parity check: this marker should land exactly on the visible point source
+        # in the reference image; if the line-map contours end up mirrored to the
+        # wrong side of it, that's a chirality (flip_axis) error, not a translation one.
+        ax.scatter(qso_coord.ra.deg, qso_coord.dec.deg, transform=ax.get_transform("world"),
+                   marker="x", s=150, linewidths=2.2, color="cyan", zorder=6,
+                   label="QSO (refined)")
+        ax.legend(loc="lower left", fontsize=8, framealpha=0.7)
 
     ax.set_title(f"{target_name} -- {line_name} astrometry check")
     ax.set_xlabel("RA")
@@ -864,11 +1099,16 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
                     line="Halpha",
                     use_continuum=True, continuum_extname="CONTINUUM_IMG",
                     search_radius_arcsec=None, mask_center_radius_arcsec=None,
+                    qso_coord=None, qso_exclude_radius_arcsec=2.0,
+                    qso_refine=True, qso_refine_search_radius_arcsec=3.0,
+                    qso_refine_bg_sigma_thresholds=(5.0, 3.0),
+                    pointing_center_radius_arcsec=None,
                     outdir=None, verify_after=True, make_plot=True,
                     bg_sigma_multiplier=3.0, centroid_bg_sigma_thresholds=(5.0, 3.0),
                     edge_warn_frac=0.4, peak_sig_threshold=5.0,
                     window_radius_fwhm_factor=1.5,
-                    contour_sigma_multiples=(3, 6, 14, 30, 65, 140, 300)):
+                    contour_sigma_multiples=(3, 6, 14, 30, 65, 140, 300),
+                    astrom_check_vmin_sigma=10.0):
     """
     flip_axis/rotate_ccw_deg select the initial instrument-to-sky data
     transform (see flip_rotate_data) -- REQUIRED, with no default, since they
@@ -926,6 +1166,22 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
     would otherwise pull the correlation toward a feature the line map
     structurally cannot show, instead of the real (fainter, clumpier)
     star-forming regions actually present in both images.
+
+    qso_coord, if given (a SkyCoord -- e.g. a catalog quasar position), is
+    refined to a precise reference-image position (refine_point_source_coord,
+    unless qso_refine=False) and then excluded (a disk of
+    qso_exclude_radius_arcsec, see _mask_disk) from BOTH the reference and
+    target sides of every correlation/centroiding step below, including the
+    continuum centroid fit itself (measure_continuum_centroid has no spatial
+    prior at all -- see module investigation notes -- and will otherwise
+    happily lock onto a bright point-source contaminant instead of the
+    intended target). pointing_center_radius_arcsec, if given, additionally
+    restricts every such step to a disk of that radius around each array's
+    own geometric center -- catches a bright, unrelated interloper elsewhere
+    in the field of view that mask_center_radius_arcsec/qso_coord can't (it
+    isn't the QSO and isn't at the array center). Both are no-ops (None,
+    the default) for every existing single-source target -- fully
+    backward compatible.
     """
     target_name = target_name or _infer_target_name(linemaps_path)
     reference_path = reference_path or default_reference_path(linemaps_path)
@@ -945,11 +1201,44 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
         search_kwargs = dict(search_center_shift=(0.0, 0.0),
                               search_radius_pix=search_radius_arcsec / ref_pix_scale_arcsec)
 
+    qso_refined_coord = None
+    if qso_coord is not None:
+        if qso_refine:
+            refined = refine_point_source_coord(
+                ref_data, ref_wcs, qso_coord,
+                search_radius_arcsec=qso_refine_search_radius_arcsec,
+                bg_sigma_thresholds=qso_refine_bg_sigma_thresholds,
+            )
+            if refined["success"]:
+                qso_refined_coord = refined["coord"]
+            else:
+                warnings.warn(f"[{target_name}] QSO coordinate refinement failed; "
+                               "using the given coordinate as-is for exclusion masking")
+                qso_refined_coord = qso_coord
+        else:
+            qso_refined_coord = qso_coord
+
+    def _restrict_for_corr(arr, wcs):
+        """Apply QSO-exclusion + pointing-center-inclusion masking (each a
+        no-op unless its parameter is set) to an array before it feeds
+        centroiding/correlation. wcs must be the array's CURRENT WCS at the
+        point of the call (its CRVAL may already have been shifted by an
+        earlier stage), since qso_refined_coord's pixel position within arr
+        depends on it."""
+        out = arr
+        if qso_refined_coord is not None:
+            out = _mask_disk(out, wcs, qso_exclude_radius_arcsec, center_coord=qso_refined_coord)
+        if pointing_center_radius_arcsec is not None:
+            out = _mask_disk(out, wcs, pointing_center_radius_arcsec, keep_inside=True)
+        return out
+
+    ref_data_for_corr = _restrict_for_corr(ref_data, ref_wcs)
+
     if not use_continuum:
         warnings.warn(f"[{target_name}] use_continuum=False: skipping continuum stage, "
                        "using a single global correlation on the line map")
         corr = cross_correlate_to_reference(
-            flipped_reg, flipped_wcs, ref_data, ref_wcs,
+            _restrict_for_corr(flipped_reg, flipped_wcs), flipped_wcs, ref_data_for_corr, ref_wcs,
             bg_sigma_multiplier=bg_sigma_multiplier, edge_warn_frac=edge_warn_frac,
             peak_sig_threshold=peak_sig_threshold, mask_center_radius_arcsec=mask_center_radius_arcsec,
             **search_kwargs,
@@ -973,7 +1262,7 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
 
         # ---- Stage 2: global correlation on the continuum map ----
         corr2 = cross_correlate_to_reference(
-            flipped_cont, flipped_wcs, ref_data, ref_wcs,
+            _restrict_for_corr(flipped_cont, flipped_wcs), flipped_wcs, ref_data_for_corr, ref_wcs,
             bg_sigma_multiplier=bg_sigma_multiplier, edge_warn_frac=edge_warn_frac,
             peak_sig_threshold=peak_sig_threshold, mask_center_radius_arcsec=mask_center_radius_arcsec,
             **search_kwargs,
@@ -993,7 +1282,7 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
         # flat-fielding/reduction banding pattern spread across many pixels),
         # unlike the correlation's own peak-based matching, so identifying the
         # galaxy itself needs a stricter threshold than aligning against it.
-        centroid = measure_continuum_centroid(flipped_cont, centroid_bg_sigma_thresholds)
+        centroid = measure_continuum_centroid(_restrict_for_corr(flipped_cont, flipped_wcs), centroid_bg_sigma_thresholds)
         if not centroid["success"]:
             warnings.warn(f"[{target_name}] continuum centroid fit failed; stage 3 falling back to global correlation")
         elif centroid["bg_sigma_used"] != centroid_bg_sigma_thresholds[0]:
@@ -1014,7 +1303,7 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
         if centroid["success"]:
             fwhm_arcsec = centroid["fwhm_eff_pix"] * native_pix_scale_arcsec
             corr3 = cross_correlate_windowed_to_reference(
-                flipped_reg, stage2_wcs, ref_data, ref_wcs, fwhm_arcsec,
+                _restrict_for_corr(flipped_reg, stage2_wcs), stage2_wcs, ref_data_for_corr, ref_wcs, fwhm_arcsec,
                 window_radius_fwhm_factor=window_radius_fwhm_factor,
                 search_center_shift=(0.0, 0.0),
                 bg_sigma_multiplier=bg_sigma_multiplier, edge_warn_frac=edge_warn_frac,
@@ -1022,7 +1311,7 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
             )
         else:
             corr3 = cross_correlate_to_reference(
-                flipped_reg, stage2_wcs, ref_data, ref_wcs,
+                _restrict_for_corr(flipped_reg, stage2_wcs), stage2_wcs, ref_data_for_corr, ref_wcs,
                 bg_sigma_multiplier=bg_sigma_multiplier, edge_warn_frac=edge_warn_frac,
                 peak_sig_threshold=peak_sig_threshold, mask_center_radius_arcsec=mask_center_radius_arcsec,
             )
@@ -1055,7 +1344,7 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
     resid_pix = None
     if verify_after:
         check = cross_correlate_to_reference(
-            flipped_reg, corrected_wcs, ref_data, ref_wcs,
+            _restrict_for_corr(flipped_reg, corrected_wcs), corrected_wcs, ref_data_for_corr, ref_wcs,
             bg_sigma_multiplier=bg_sigma_multiplier, edge_warn_frac=1.0, peak_sig_threshold=0.0,
             mask_center_radius_arcsec=mask_center_radius_arcsec,
         )
@@ -1076,7 +1365,8 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
         out_png = plot_alignment_diagnostic(
             ref_data, ref_wcs, corrected_flux, corrected_line_wcs,
             target_name, line, os.path.join(outdir, f"{target_name}_astrom_check.png"),
-            contour_sigma_multiples,
+            contour_sigma_multiples, vmin_sigma_floor=astrom_check_vmin_sigma,
+            qso_coord=qso_refined_coord,
         )
 
     print(
@@ -1094,7 +1384,142 @@ def correct_target(linemaps_path, flip_axis, rotate_ccw_deg, reference_path=None
         shift_x_pix=corr3["shift_x"], shift_y_pix=corr3["shift_y"],
         peak_significance=corr3["peak_significance"], warnings=corr2_warnings + corr3["warnings"],
         verify_residual_pix=resid_pix, out_fits=out_fits, out_png=out_png,
+        qso_coord_refined=qso_refined_coord,
     )
+
+
+# The 8 dihedral (flip_axis, rotate_ccw_deg) combinations flip_rotate_data
+# collapses onto -- confirmed this session: flip_axis='y' at any rotation
+# duplicates flip_axis='x' at rotation+180deg, so {None,'x'} x all 4
+# rotations already exhausts the group without duplicates.
+ORIENTATION_CANDIDATES = [(fa, rot) for fa in (None, "x") for rot in (0, 90, 180, 270)]
+
+
+def auto_correct_target(linemaps_path, calibration_reference_path, science_reference_path=None,
+                         target_name=None, qso_coord=None, candidates=None, outdir=None,
+                         calibrator_exclude_radius_arcsec=5.0, calibrator_sigma_threshold=8.0,
+                         calibrator_aperture_radius_arcsec=5.0, calibrator_confirm_sigma=5.0,
+                         **correct_target_kwargs):
+    """
+    Automatically determine (flip_axis, rotate_ccw_deg) for correct_target
+    instead of trusting a single manual guess: cross-correlation is provably
+    blind to reflection (a single, roughly-symmetric target's correlation
+    peak is nearly invariant under mirroring about its own centroid), so a
+    wrong-parity guess can pass every one of correct_target's own self-
+    consistency checks. This tries all 8 dihedral combinations
+    (ORIENTATION_CANDIDATES) and scores each against auto-detected
+    calibrator sources (find_calibrator_sources/score_orientation_candidate)
+    -- a second, spatially offset source is what actually discriminates
+    parity, not the target itself (confirmed empirically this session: for
+    one target, an unrelated field star 12.9" away showed a flipped East-
+    West sign under a wrong-parity transform, while the QSO+galaxy blend
+    itself, too tight to resolve independently, gave no such signal).
+
+    calibration_reference_path should be a WIDE reference cutout -- wide
+    enough to plausibly contain a usable secondary source; a target's own
+    science-sized reference cutout is often too small (confirmed for one
+    target this session, whose QSO+galaxy blend has no other >8sigma source
+    within 30 arcsec). science_reference_path (passed to correct_target
+    itself) defaults to calibration_reference_path when not given
+    separately.
+
+    qso_coord, if given, is both (a) excluded from every candidate's
+    correlation/centroiding (see correct_target's own qso_coord handling --
+    forwarded via **correct_target_kwargs is NOT how this works; qso_coord
+    is a named parameter here specifically so it can also seed
+    find_calibrator_sources' own exclusion) and (b) the exclusion center
+    used when auto-detecting calibrator sources on calibration_reference_path
+    (so the QSO/target region itself is never mistaken for a calibrator).
+
+    Every candidate's full correct_target() output (FITS, continuum-centroid
+    PNG, astrom-check PNG) is written to
+    {outdir}/orientation_search/{flip_label}_{rotate_ccw_deg}/ for visual
+    review, not just the winner's -- "more compute, but thorough" was an
+    explicit choice here over a cheaper numbers-only ranking.
+
+    Returns a dict:
+      best -- the winning candidate's correct_target() result dict, plus
+        'flip_axis'/'rotate_ccw_deg'/'calibrator_score'/'n_calibrators_confirmed'.
+      ranked -- list of every candidate's result (same shape as best, minus
+        the "winning" framing), best-first.
+      calibrators -- find_calibrator_sources' own output list.
+      orientation_ambiguous -- True if zero calibrators were found at all,
+        OR none were ever confirmed by ANY candidate (both mean nothing
+        actually discriminated parity, so the ranking fell back to stage-3
+        peak_significance alone) -- treat the "best" pick with appropriate
+        caution in either case.
+    """
+    target_name = target_name or _infer_target_name(linemaps_path)
+    science_reference_path = science_reference_path or calibration_reference_path
+    outdir = outdir or os.path.dirname(os.path.abspath(linemaps_path))
+    candidates = candidates or ORIENTATION_CANDIDATES
+    continuum_extname = correct_target_kwargs.get("continuum_extname", "CONTINUUM_IMG")
+
+    calib_data, calib_wcs, _ = load_reference_image(calibration_reference_path)
+    calibrators = []
+    if qso_coord is not None:
+        calibrators = find_calibrator_sources(
+            calib_data, calib_wcs, qso_coord,
+            exclude_radius_arcsec=calibrator_exclude_radius_arcsec,
+            sigma_threshold=calibrator_sigma_threshold,
+        )
+    if not calibrators:
+        warnings.warn(f"[{target_name}] no calibrator sources found (qso_coord={qso_coord}); "
+                       "orientation ranking will fall back to stage-3 peak_significance alone "
+                       "and should be treated as unverified")
+
+    ranked = []
+    for flip_axis, rotate_ccw_deg in candidates:
+        flip_label = flip_axis if flip_axis is not None else "none"
+        cand_outdir = os.path.join(outdir, "orientation_search", f"{flip_label}_{rotate_ccw_deg}")
+        os.makedirs(cand_outdir, exist_ok=True)
+        try:
+            res = correct_target(
+                linemaps_path, flip_axis=flip_axis, rotate_ccw_deg=rotate_ccw_deg,
+                reference_path=science_reference_path, target_name=target_name,
+                qso_coord=qso_coord, outdir=cand_outdir, **correct_target_kwargs,
+            )
+        except Exception as exc:
+            warnings.warn(f"[{target_name}] orientation candidate flip={flip_axis} rot={rotate_ccw_deg} failed: {exc}")
+            continue
+
+        cal_score, n_confirmed, cal_details = 0.0, 0, []
+        if calibrators:
+            cont_corrected, cont_corrected_wcs, _ = load_line_extension(res["out_fits"], continuum_extname)
+            cal_score, n_confirmed, cal_details = score_orientation_candidate(
+                cont_corrected, cont_corrected_wcs, calibrators,
+                aperture_radius_arcsec=calibrator_aperture_radius_arcsec,
+                sigma_threshold=calibrator_confirm_sigma,
+            )
+
+        ranked.append(dict(
+            res, flip_axis=flip_axis, rotate_ccw_deg=rotate_ccw_deg,
+            calibrator_score=cal_score, n_calibrators_confirmed=n_confirmed,
+            calibrator_details=cal_details,
+        ))
+
+    if not ranked:
+        raise RuntimeError(f"[{target_name}] every orientation candidate failed")
+
+    ranked.sort(key=lambda r: (r["calibrator_score"], r["peak_significance"]), reverse=True)
+    best = ranked[0]
+    orientation_ambiguous = not calibrators or best["n_calibrators_confirmed"] == 0
+    if orientation_ambiguous and calibrators:
+        warnings.warn(f"[{target_name}] {len(calibrators)} calibrator(s) found but none were "
+                       "confirmed by ANY orientation candidate; ranking fell back to stage-3 "
+                       "peak_significance alone and should be treated as unverified")
+
+    print(f"[{target_name}] orientation search ranking "
+          f"({'AMBIGUOUS -- peak_significance only, see warnings' if orientation_ambiguous else 'calibrator-scored'}):")
+    for r in ranked:
+        flip_label = r["flip_axis"] if r["flip_axis"] is not None else "none"
+        print(f"    flip={flip_label:>4s} rot={r['rotate_ccw_deg']:>3d}  "
+              f"calibrator_score={r['calibrator_score']:.1f} "
+              f"n_confirmed={r['n_calibrators_confirmed']}/{len(calibrators)}  "
+              f"peak_sig={r['peak_significance']:.1f}")
+
+    return dict(best=best, ranked=ranked, calibrators=calibrators,
+                orientation_ambiguous=orientation_ambiguous)
 
 
 # ----------------------------------------------------------------------
@@ -1165,6 +1590,12 @@ def main():
     parser.add_argument("--contour-sigma", type=float, nargs="+", default=[3, 6, 14, 30, 65, 140, 300])
     parser.add_argument("--no-verify", dest="verify_after", action="store_false", default=True)
     parser.add_argument("--no-plot", dest="make_plot", action="store_false", default=True)
+    parser.add_argument("--astrom-check-vmin-sigma", type=float, default=10.0,
+                         help="Background-sigma floor for the astrom_check plot's reference-image "
+                              "display stretch (default: 10.0, capped at half the image's peak "
+                              "significance). Lower this to keep more of the reference's faint, "
+                              "extended galaxy light visible; the default clips it to emphasize "
+                              "bright compact structure instead.")
     args = parser.parse_args()
 
     if args.correct_cube_from_linemaps is not None:
@@ -1191,6 +1622,7 @@ def main():
         edge_warn_frac=args.edge_warn_frac, peak_sig_threshold=args.peak_sig_threshold,
         window_radius_fwhm_factor=args.window_radius_fwhm_factor,
         contour_sigma_multiples=tuple(args.contour_sigma),
+        astrom_check_vmin_sigma=args.astrom_check_vmin_sigma,
     )
 
 
