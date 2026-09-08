@@ -45,6 +45,7 @@ from pathlib import Path
 
 from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, LUT_DIR
 from llamas_pyjamas.Trace.traceLlamas import TraceLlamas
+from llamas_pyjamas.Utils.detectorProps import props_for_header
 
 logger = logging.getLogger(__name__)
 
@@ -205,24 +206,16 @@ class ExtractLlamas:
                 self.dead_fibers = []  # Default to empty list if any error occurs
                 logger.warning(f"Error accessing dead fibers in LUT: {e}")
 
-            # Detector gain (e-/ADU) and read noise (e-/DN) are read from the header
-            # when available; resolved here (before the per-fibre loop, not after)
-            # because the 'horne' branch below needs a read-noise estimate for its
-            # internal variance weighting, in addition to the final ERROR extension.
-            def _hdr_num(keys, default):
-                for k in keys:
-                    v = self.hdr.get(k)
-                    if v is not None:
-                        try:
-                            fv = float(v)
-                            if fv > 0:
-                                return fv
-                        except (TypeError, ValueError):
-                            pass
-                return default
-            gain = _hdr_num(('EGAIN', 'GAIN', 'GAIN1', 'CCDGAIN'), DEFAULT_GAIN)
-            readnoise = _hdr_num(('RDNOISE', 'RDNOISE1', 'READNOIS', 'RON'),
-                                 DEFAULT_READNOISE)
+            # Detector gain (e-/ADU) and read noise (e-/DN): explicit header
+            # keyword first, then the lab-characterisation CSV keyed on the
+            # CAMSN serial (props_for_header — the SAME source
+            # Masking/cosmicLlamas.py uses for CR detection, so CR cleaning and
+            # this error model can't drift apart), then the package defaults.
+            # Resolved here (before the per-fibre loop, not after) because the
+            # 'horne' branch below needs a read-noise estimate for its internal
+            # variance weighting, in addition to the final ERROR extension.
+            gain, readnoise, _gain_src = props_for_header(self.hdr, DEFAULT_GAIN, DEFAULT_READNOISE)
+            logger.info(f'Gain/read-noise resolved from {_gain_src}: gain={gain:.3f} e-/ADU, readnoise={readnoise:.2f} e-')
             _rn2 = readnoise ** 2
             _nx = trace.naxis1
             # Boxcar aperture half-width [px]. Overridable via LLAMAS_BOXCAR_HALFWIDTH
@@ -348,46 +341,20 @@ class ExtractLlamas:
                     self.counts[ifiber,:] = extracted
             self.old_count_shape = self.counts.shape
             logger.info(f'Benchside {benchside} counts shape {self.counts.shape}')
-            # Process the dead fibers by inserting dummy arrays at specific indices
-            # if self.dead_fibers:
-            #     logger.info(f'Processing dead fibers: {self.dead_fibers}')
-                
-
-            #     # Sort dead fibers in descending order to avoid index shifting
-            #     # when we insert multiple rows
-            #     for dead_idx in sorted(self.dead_fibers, reverse=True):
-            #         # Create a row of zeros for the dead fiber
-            #         dummy_counts = np.zeros(trace.naxis1)
-                    
-            #         self.counts = np.insert(self.counts, dead_idx, dummy_counts, axis=0)
-            
-            if self.dead_fibers:
-                logger.info(f'Processing dead fibers: {self.dead_fibers}')
-                
-                # Create new array with space for dead fibers
-                total_fibers = trace.nfibers + len(self.dead_fibers)
-                new_counts = np.zeros((total_fibers, trace.naxis1))
-                
-                # Copy data from original counts array to correct positions in new array
-                current_idx = 0
-                dead_set = set(self.dead_fibers)  # Convert to set for faster lookup
-                
-                for i in range(total_fibers):
-                    if i in dead_set:
-                        new_counts[i] = np.zeros(trace.naxis1)
-                        # Leave zeros for dead fiber positions
-                        logger.info(f"Inserting dead fiber at index {i}")
-                        continue
-                    else:
-                        # Copy data from original array if position exists
-                        #if current_idx < len(self.counts):
-                        new_counts[i] = self.counts[current_idx]
-                        current_idx += 1
-                
-                # Replace the counts array with the new one
-                self.counts = new_counts
-                self.fiberid = np.arange(total_fibers)
-                logger.info(f'New counts shape after dead fiber insertion: {self.counts.shape}')
+            # NOTE: dead fibres are NOT inserted into counts here. Every per-fibre
+            # array (counts, wave, xshift, sky, relative_throughput, errors, ...)
+            # stays LIVE-indexed and mutually aligned, so per-fibre operations
+            # (arcTransfer, skyModel) pair the correct rows. An earlier version
+            # padded only counts to fibremap indexing while wave/xshift/sky/
+            # relative_throughput stayed live, so counts[i] and wave[i] described
+            # different fibres after the first dead fibre -- a silent
+            # misalignment that also corrupted the flat-throughput calculation in
+            # Arc/arcLlamasMulti.py (it reads a DIFFERENT extraction object's
+            # counts at a live-fibre-space index, which only lines up if counts
+            # is live-indexed like everything else). The fibermap expansion is
+            # done once, explicitly, at RSS generation via
+            # llamas_pyjamas.Utils.deadfibers (dead_fibers holds the fibremap
+            # positions). self.dead_fibers is preserved for that step.
 
             # F4 (Pass 1): per-fibre uncertainty from photon + read noise.
             # Populates `errors`, which llamasRSS writes to the ERROR extension

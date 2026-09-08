@@ -1,0 +1,86 @@
+# fluxcal_cubes.py configuration file.
+#
+# Run with:  python fluxcal_cubes.py --config fluxcal_config.yaml
+# Any flag also passed on the command line overrides the corresponding value here.
+# Leave a field blank (or delete its line) to fall back to the script's built-in default.
+
+# Pipeline stage: extract | sensfunc | apply | all
+mode: all
+
+# --- Standard star identity (sensfunc stage) ---
+# Name resolved against PypeIt's standard-star archive. Leave blank and set
+# star_ra/star_dec instead if the name doesn't resolve there.
+standard_star_name: HD14943
+star_ra:
+star_dec:
+
+# Force a sensfunc algorithm (UVIS or IR) for every channel instead of
+# auto-selecting per channel from wavelength (IR above 7000 Angstrom).
+algorithm:
+
+# PypeIt PYP_SPEC spectrograph name.
+pyp_spec: magellan_llamas
+
+# --- Sensfunc zeropoint fit tuning (per channel) ---
+# Polynomial order for the zeropoint fit. Red defaults higher than PypeIt's
+# own default (5) because the O2/H2O telluric-band structure there needs
+# more flexibility; set to 5 to restore PypeIt's default.
+polyorder_blue:
+polyorder_green:
+polyorder_red: 7
+
+# Restrict the fit to a wavelength window (Angstrom), excluding the steep
+# low-throughput roll-off at the channel edges that otherwise drags a
+# whole-range polynomial fit off the well-behaved plateau. Red defaults to
+# 6700-10000 based on this dataset's QA plots; blue/green are unrestricted
+# by default since no equivalent edge problem has been seen there yet.
+fit_wave_min_blue:
+fit_wave_max_blue:
+fit_wave_min_green:
+fit_wave_max_green:
+fit_wave_min_red: 6700.0
+fit_wave_max_red: 10000.0
+
+# --- Standard star cube + RSS pair (extract stage) ---
+# The cube is used only to centroid the star; flux is actually summed from
+# the sibling RSS file's native fiber spectra.
+std_cube_blue: cubes/HD14943/LLAMAS_2025-12-17_05-21-17.9_SCI22_mef_flat_corrected_cube_blue.fits
+std_cube_green: cubes/HD14943/LLAMAS_2025-12-17_05-21-17.9_SCI22_mef_flat_corrected_cube_green.fits
+std_cube_red: cubes/HD14943/LLAMAS_2025-12-17_05-21-17.9_SCI22_mef_flat_corrected_cube_red.fits
+
+std_rss_blue: extractions/LLAMAS_2025-12-17_05-21-17.9_SCI22_mef_flat_corrected_extract_RSS_blue.fits
+std_rss_green: extractions/LLAMAS_2025-12-17_05-21-17.9_SCI22_mef_flat_corrected_extract_RSS_green.fits
+std_rss_red: extractions/LLAMAS_2025-12-17_05-21-17.9_SCI22_mef_flat_corrected_extract_RSS_red.fits
+
+# --- Pre-built inputs, to skip earlier stages (leave blank for a fresh --mode all run) ---
+# Pre-extracted standard spec1d files (skip the extract stage).
+std_spec1d_blue:
+std_spec1d_green:
+std_spec1d_red:
+
+# Pre-built sensfunc files (skip the extract+sensfunc stages).
+sens_blue:
+sens_green:
+sens_red:
+
+# --- Science cubes to flux-calibrate (apply stage) ---
+science_glob_blue: "cubes/FRB20240210A/*_cube_blue.fits"
+science_glob_green: "cubes/FRB20240210A/*_cube_green.fits"
+science_glob_red: "cubes/FRB20240210A/*_cube_red.fits"
+
+# --- Extraction tuning ---
+boxcar_radius_arcsec: 1.0
+centroid_kernel_arcsec: 1.0
+
+# --- Science cube header keys (apply stage only; extraction always reads
+# the standard RSS file's own REXPTIME/AIRMASS regardless of these) ---
+exptime_key: EXPTIME
+default_exptime: 1.0
+airmass_key: AIRMASS
+default_airmass: 1.0
+
+# --- Output / run behavior ---
+output_root: fluxcal_HD14943
+overwrite: true
+verbose: true
+debug: false
