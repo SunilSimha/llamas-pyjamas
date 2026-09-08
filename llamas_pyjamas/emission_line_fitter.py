@@ -57,6 +57,7 @@ import argparse
 import csv
 import os
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 from astropy.io import fits
@@ -121,6 +122,20 @@ LINE_GROUPS = {
     "halpha_nii":  ["NII_6548", "Halpha", "NII_6584"],
     "sii_doublet": ["SII_6716", "SII_6731"],
 }
+
+# group_name -> line needing a broad, negative-amplitude "absorption"
+# Gaussian companion (see build_model's broad_component). Real star-forming
+# galaxies have stellar Balmer ABSORPTION troughs underlying the narrow
+# nebular emission line -- broad compared to the narrow line, so a single
+# positive Gaussian + smooth polynomial continuum can't represent both at
+# once (the polynomial can't track a broad, line-centered dip), biasing the
+# narrow line's fitted amplitude. Hbeta only (per explicit request) -- its
+# absorption is typically more significant relative to its own emission
+# than Halpha's; the mechanism generalizes to any group/line if needed later.
+GROUP_BROAD_COMPONENT = {"hbeta_oiii": "Hbeta"}
+BROAD_SIGMA_BOUNDS_AA = (2.0, 20.0)  # observed-frame Angstrom, free-fit bounds (pre-fit determination)
+BROAD_SIGMA_INIT_AA = 6.0            # observed-frame Angstrom, free-fit initial guess
+BROAD_WINDOW_PAD_EXTRA_AA = 40.0     # extra fit-window padding for a group with a broad component
 
 C_KMS = 2.99792458e5
 
@@ -766,6 +781,88 @@ def compute_metallicity_map(nii_flux, halpha_flux, nii_err=None, halpha_err=None
     return metallicity
 
 
+# O3N2 calibration (Nakajima et al. 2022, ApJS 262, 3, arXiv:2206.02824, Table 4,
+# "All" sample, N=2): log10(O3N2) = c0 + c1*x + c2*x^2, x = 12+log(O/H) - 8.69,
+# where O3N2 = ([OIII]5007/Hbeta) / ([NII]6584/Halpha). Valid over
+# 12+log(O/H) = [7.1, 8.9] with a quoted scatter of 0.34 dex.
+O3N2_COEFFS = (0.226, -4.710, -2.138)
+O3N2_SOLAR_OFFSET = 8.69
+O3N2_VALID_RANGE = (7.1, 8.9)
+O3N2_RMS = 0.34
+
+
+def _o3n2_forward(metallicity):
+    """Forward O3N2 calibration: 12+log(O/H) -> log10(O3N2)."""
+    c0, c1, c2 = O3N2_COEFFS
+    x = np.asarray(metallicity, dtype=float) - O3N2_SOLAR_OFFSET
+    return c0 + c1 * x + c2 * x**2
+
+
+def _invert_o3n2(log_o3n2):
+    """
+    Invert the O3N2 calibration: log10(O3N2) -> 12+log(O/H).
+
+    c2 < 0 makes this a downward-opening parabola in x = 12+log(O/H) - 8.69,
+    with a maximum at x_vertex = -c1/(2*c2) ~= -1.10 (12+log(O/H) ~= 7.59).
+    For x >= x_vertex the relation is monotonically decreasing -- the
+    physically expected O3N2 behaviour, and the branch essentially all
+    realistic star-forming galaxies (12+log(O/H) >~ 7.6) fall on. We keep
+    only that root; the other (low-metallicity, increasing) branch and any
+    log_o3n2 above the parabola's maximum (no real root) are set to NaN, as
+    is anything landing outside O3N2_VALID_RANGE.
+    """
+    log_o3n2 = np.asarray(log_o3n2, dtype=float)
+    c0, c1, c2 = O3N2_COEFFS
+    a, b, c = c2, c1, (c0 - log_o3n2)
+    with np.errstate(invalid="ignore"):
+        disc = b**2 - 4 * a * c
+        real = disc >= 0
+        sqrt_disc = np.sqrt(np.where(real, disc, 0.0))
+        x1 = (-b + sqrt_disc) / (2 * a)
+        x2 = (-b - sqrt_disc) / (2 * a)
+    x_vertex = -c1 / (2 * c2)
+    x = np.where(x1 >= x_vertex, x1, np.where(x2 >= x_vertex, x2, np.nan))
+    x[~real] = np.nan
+    metallicity = O3N2_SOLAR_OFFSET + x
+    out_of_range = (metallicity < O3N2_VALID_RANGE[0]) | (metallicity > O3N2_VALID_RANGE[1])
+    metallicity[out_of_range] = np.nan
+    return metallicity
+
+
+def compute_metallicity_map_o3n2(oiii_flux, hbeta_flux, nii_flux, halpha_flux,
+                                  oiii_err=None, hbeta_err=None, nii_err=None,
+                                  halpha_err=None, sn_min=3.0):
+    """
+    Per-spaxel gas-phase metallicity via the O3N2 calibration of
+    Nakajima et al. (2022) -- see _invert_o3n2.
+
+    NaN wherever any of the four lines has no valid measurement: NaN flux,
+    a non-positive ratio component, or -- when all four *_err arrays are
+    given -- S/N < sn_min on any of the four lines. Mirrors
+    compute_metallicity_map's N2 invalid-pixel logic, extended to four lines.
+    """
+    with np.errstate(invalid="ignore", divide="ignore"):
+        oiii_hbeta = oiii_flux / hbeta_flux
+        nii_halpha = nii_flux / halpha_flux
+        ratio = oiii_hbeta / nii_halpha
+        log_o3n2 = np.log10(ratio)
+    metallicity = _invert_o3n2(log_o3n2)
+    invalid = (~np.isfinite(oiii_flux) | ~np.isfinite(hbeta_flux)
+               | ~np.isfinite(nii_flux) | ~np.isfinite(halpha_flux)
+               | ~(oiii_hbeta > 0) | ~(nii_halpha > 0))
+    if (oiii_err is not None and hbeta_err is not None
+            and nii_err is not None and halpha_err is not None):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            oiii_sn = oiii_flux / oiii_err
+            hbeta_sn = hbeta_flux / hbeta_err
+            nii_sn = nii_flux / nii_err
+            halpha_sn = halpha_flux / halpha_err
+        invalid |= (~(oiii_sn >= sn_min) | ~(hbeta_sn >= sn_min)
+                    | ~(nii_sn >= sn_min) | ~(halpha_sn >= sn_min))
+    metallicity[invalid] = np.nan
+    return metallicity
+
+
 # ----------------------------------------------------------------------
 # Model
 # ----------------------------------------------------------------------
@@ -797,7 +894,7 @@ def group_wave_window(group_lines, z, pad):
 
 
 def build_model(line_names, tie_doublets, sigma_fixed=None, poly_order=1,
-                 wave_ref=0.0, wave_scale=1.0):
+                 wave_ref=0.0, wave_scale=1.0, broad_component=None):
     """
     Build a model function for a set of lines, ALL sharing the same single
     `sigma` (one line width per complex) and the same `z` (one redshift per
@@ -841,12 +938,27 @@ def build_model(line_names, tie_doublets, sigma_fixed=None, poly_order=1,
     (built from what's left of `free_lines` once both kinds of tied/derived
     lines are removed).
 
+    broad_component: optional (line_name, sigma_or_None) -- line_name must be
+    present in line_names. Adds ONE extra parameter, `broad_amp` (the caller,
+    fit_spaxel, bounds it to (-inf, 0]) -- a broad, negative-amplitude
+    "absorption" Gaussian at that same line's own center (same z, no separate
+    redshift), representing a stellar Balmer absorption trough underlying a
+    narrow nebular emission line (see GROUP_BROAD_COMPONENT). If sigma_or_None
+    is None, a second extra parameter `broad_sigma` is ALSO free -- the same
+    free/fixed toggle sigma_fixed already provides for the narrow width, used
+    the same way (free pre-fit to determine it once, held fixed for the main
+    per-spaxel pass -- see determine_group_sigma/fit_cube). Both extra
+    parameters are appended at the very END of the parameter vector, after
+    ratio_lines' own ratio parameters.
+
     Returns
     -------
     model_fn, free_lines (list[str], the amplitude parameters),
     derived (dict[str, tuple[str, float]]),
     ratio_lines (list[str], the weak member of each active density-sensitive
-    pair, in the order their ratio parameters appear after free_lines' amps)
+    pair, in the order their ratio parameters appear after free_lines' amps),
+    broad_line (str or None, the resolved broad_component line name -- for
+    callers that don't want to re-derive it from broad_component themselves)
     """
     derived = {}
     free_lines = []
@@ -863,8 +975,10 @@ def build_model(line_names, tie_doublets, sigma_fixed=None, poly_order=1,
     free_lines = [name for name in free_lines if name not in ratio_lines]
 
     n_cont = poly_order + 1
+    broad_line, broad_sigma_fixed = (None, None) if broad_component is None else broad_component
+    broad_sigma_free = broad_line is not None and broad_sigma_fixed is None
 
-    def _flux(wave, z, cont_coeffs, sigma, params):
+    def _flux(wave, z, cont_coeffs, sigma, params, broad_sigma, broad_amp):
         amp_of = dict(zip(free_lines, params[:len(free_lines)]))
         ratio_of = dict(zip(ratio_lines, params[len(free_lines):]))
         x = (wave - wave_ref) / wave_scale
@@ -881,22 +995,34 @@ def build_model(line_names, tie_doublets, sigma_fixed=None, poly_order=1,
             else:
                 amp = amp_of[name]
             flux = flux + gaussian(wave, amp, LINES[name] * (1 + z), sigma)
+        if broad_line is not None:
+            flux = flux + gaussian(wave, broad_amp, LINES[broad_line] * (1 + z), broad_sigma)
         return flux
+
+    def _split_broad_tail(tail):
+        """Pull (broad_sigma, broad_amp, remaining_params) off the END of a parameter tail tuple."""
+        if broad_line is None:
+            return None, None, tail
+        if broad_sigma_free:
+            return tail[-2], tail[-1], tail[:-2]
+        return broad_sigma_fixed, tail[-1], tail[:-1]
 
     if sigma_fixed is None:
         def model_fn(wave, z, *rest):
-            cont_coeffs, sigma, params = rest[:n_cont], rest[n_cont], rest[n_cont + 1:]
-            return _flux(wave, z, cont_coeffs, sigma, params)
+            cont_coeffs, sigma, tail = rest[:n_cont], rest[n_cont], rest[n_cont + 1:]
+            broad_sigma, broad_amp, params = _split_broad_tail(tail)
+            return _flux(wave, z, cont_coeffs, sigma, params, broad_sigma, broad_amp)
     else:
         def model_fn(wave, z, *rest):
-            cont_coeffs, params = rest[:n_cont], rest[n_cont:]
-            return _flux(wave, z, cont_coeffs, sigma_fixed, params)
+            cont_coeffs, tail = rest[:n_cont], rest[n_cont:]
+            broad_sigma, broad_amp, params = _split_broad_tail(tail)
+            return _flux(wave, z, cont_coeffs, sigma_fixed, params, broad_sigma, broad_amp)
 
-    return model_fn, free_lines, derived, ratio_lines
+    return model_fn, free_lines, derived, ratio_lines, broad_line
 
 
 def fit_continuum_polynomial(wave, flux, var, group_lines, z, sigma_for_mask, poly_order,
-                              wave_ref, wave_scale, mask_halfwidth_sigma=4.0):
+                              wave_ref, wave_scale, mask_halfwidth_sigma=4.0, broad_mask=None):
     """
     Stage-A pre-fit: robust weighted-linear-least-squares polynomial fit to
     the continuum ALONE, with every line in group_lines masked out (+/-
@@ -904,6 +1030,16 @@ def fit_continuum_polynomial(wave, flux, var, group_lines, z, sigma_for_mask, po
     wave/flux/var are assumed already restricted to finite, good pixels
     within the group's fit window (see fit_spaxel) -- this function only
     additionally excludes the line windows.
+
+    broad_mask: optional (broad_line_center, broad_sigma_for_mask) -- ORed
+    into the same line_mask (same mask_halfwidth_sigma convention) so a
+    group's broad absorption trough (see build_model's broad_component) is
+    ALSO excluded from the "continuum-only" population here. Without this,
+    the still-unmasked absorption dip would bias the seeded polynomial
+    coefficients (this function only ever produces a p0 seed for stage B,
+    but a bad seed can pull the joint fit into a poor local minimum, same
+    concern the two-stage design already guards against for the narrow
+    lines -- see the docstring paragraph below).
 
     Used solely to seed fit_spaxel's stage-B joint (continuum+lines)
     curve_fit with a good initial guess for the continuum coefficients --
@@ -922,6 +1058,9 @@ def fit_continuum_polynomial(wave, flux, var, group_lines, z, sigma_for_mask, po
     line_mask = np.zeros(wave.shape, dtype=bool)
     for c in line_centers:
         line_mask |= np.abs(wave - c) <= mask_halfwidth_sigma * sigma_for_mask
+    if broad_mask is not None:
+        broad_center, broad_sigma_for_mask = broad_mask
+        line_mask |= np.abs(wave - broad_center) <= mask_halfwidth_sigma * broad_sigma_for_mask
     cont_only = ~line_mask
 
     coeffs = np.zeros(poly_order + 1)
@@ -937,9 +1076,43 @@ def fit_continuum_polynomial(wave, flux, var, group_lines, z, sigma_for_mask, po
 # ----------------------------------------------------------------------
 # Per-spaxel fit
 # ----------------------------------------------------------------------
+def _clip_negative_outliers(f, clip_nsigma):
+    """
+    One-sided, robust (median/MAD-based, NOT the cube's own quoted
+    per-pixel sigma) sigma-clip mask over a spaxel's good-pixel flux
+    values: True for pixels at or above (median - clip_nsigma * sigma_mad),
+    False for severe negative outliers only -- a real bright emission line
+    is a positive excursion and is never clipped; this exists to catch the
+    opposite case, e.g. a cosmic-ray residual or bad column landing well
+    below the continuum (confirmed by eye in FRB20250316A's KCWI blue
+    cube: a handful of spaxels have a single pixel at flux ~ -50 to -175
+    against a continuum of order ~0.1-1, dragging the broad Balmer-
+    absorption Gaussian to an unphysically deep trough trying to fit it).
+
+    Median/MAD (sigma_mad = 1.4826 * MAD) rather than the per-pixel
+    sqrt(var) already available: the latter can itself be miscalibrated
+    (see the error-inflation work for this same cube -- its quoted
+    variance understates the true noise by ~11-12x), which would clip far
+    too aggressively if used directly as the sigma scale here. MAD over
+    the whole fit window is robust to both the rare severe artifact this
+    targets and the handful of genuine line-core pixels among the many
+    more numerous continuum pixels in a typical window.
+    """
+    if f.size == 0:
+        return np.ones(f.shape, dtype=bool)
+    med = np.median(f)
+    sigma_mad = 1.4826 * np.median(np.abs(f - med))
+    if sigma_mad <= 0:
+        return np.ones(f.shape, dtype=bool)
+    return f >= (med - clip_nsigma * sigma_mad)
+
+
 def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
                sigma_bounds, tie_doublets, window_pad=60.0, min_good_pix=10,
-               sigma_fixed=None, poly_order=3, continuum_mask_halfwidth_sigma=4.0):
+               sigma_fixed=None, poly_order=3, continuum_mask_halfwidth_sigma=4.0,
+               broad_component=None, broad_sigma_fixed=None,
+               broad_sigma_init=BROAD_SIGMA_INIT_AA, broad_sigma_bounds=BROAD_SIGMA_BOUNDS_AA,
+               clip_nsigma=5.0):
     """
     Fit one spaxel's spectrum for a given line group.
 
@@ -949,6 +1122,17 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
     sigma_init/sigma_bounds. Both call shapes are otherwise identical, so the
     same call site can be reused for a free-sigma pre-fit (sigma_fixed
     omitted) and the main, sigma-held-fixed fitting pass (see fit_cube).
+
+    broad_component: optional line name (must be in group_lines) to give a
+    broad, negative-amplitude "absorption" Gaussian companion (see
+    build_model/GROUP_BROAD_COMPONENT) -- e.g. "Hbeta" for the hbeta_oiii
+    group, to represent a stellar Balmer absorption trough underlying the
+    narrow nebular emission line. broad_sigma_fixed follows the exact same
+    free/fixed toggle as sigma_fixed (None -> free, bounded by
+    broad_sigma_init/broad_sigma_bounds; a float -> held fixed), so the same
+    two-stage determine-then-fix pattern used for the narrow sigma applies
+    here too (see determine_group_sigma/fit_cube). Ignored (no broad term at
+    all) when broad_component is None.
 
     The continuum is a degree-poly_order polynomial (default 3, i.e. cubic --
     a plain linear continuum (poly_order=1) systematically failed to track
@@ -966,7 +1150,25 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
     'sigma', 'z', 'cont0'/'cont1' (first two continuum coefficients, kept for
     backward compatibility), 'cont_coeffs'/'cont_coeffs_err' (all poly_order+1
     coefficients and their errors), 'wave_ref'/'wave_scale' (the continuum's
-    x-basis, needed to evaluate cont_coeffs), 'chi2_reduced', 'success'.
+    x-basis, needed to evaluate cont_coeffs), 'ratio'/'ratio_err' (dict per
+    RATIO_BOUNDS line in group_lines -- the fitted weak/strong doublet ratio
+    and its error; empty for a group with no density-sensitive doublet, e.g.
+    hbeta_oiii/halpha_nii, whose OIII/NII ratios are fixed atomic constants
+    rather than fitted -- see DOUBLET_RATIOS vs RATIO_BOUNDS), 'dof',
+    'n_good' (number of finite/positive-variance/positive-weight pixels
+    actually used by curve_fit), 'chi2_reduced', 'success'. A ratio pinned at
+    its RATIO_BOUNDS edge, or an anomalous chi2_reduced/n_good/cont_coeffs
+    value, is a useful signature for distinguishing a real fit from one
+    driven by non-astrophysical artifacts (e.g. detector banding). When
+    broad_component is given: 'broad_sigma'/'broad_sigma_err' (the fixed
+    value with err=0.0 if broad_sigma_fixed was given, else the free fit
+    result) and 'broad_amp'/'broad_amp_err' (always fitted, bounded
+    (-inf, 0]) -- all four stay NaN if broad_component is None.
+
+    clip_nsigma: see _clip_negative_outliers -- a severe negative-outlier
+    pixel (e.g. a cosmic-ray residual) is dropped from the fit entirely
+    before either fitting stage, same as a masked (weight<=0) pixel. Set to
+    None to disable (reproduces the pre-clipping behavior exactly).
     """
     result = {
         "amp": {name: np.nan for name in group_lines},
@@ -981,6 +1183,14 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
         "cont_coeffs_err": None,
         "wave_ref": np.nan,
         "wave_scale": np.nan,
+        "ratio": {},
+        "ratio_err": {},
+        "broad_sigma": np.nan,
+        "broad_sigma_err": np.nan,
+        "broad_amp": np.nan,
+        "broad_amp_err": np.nan,
+        "dof": np.nan,
+        "n_good": 0,
         "chi2_reduced": np.nan,
         "success": False,
     }
@@ -1000,21 +1210,36 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
         return result
 
     w, f, v = w[good], f[good], v[good]
+
+    if clip_nsigma is not None:
+        clip_mask = _clip_negative_outliers(f, clip_nsigma)
+        if not np.all(clip_mask):
+            w, f, v = w[clip_mask], f[clip_mask], v[clip_mask]
+            if w.size < min_good_pix:
+                return result
+
     sigma_y = np.sqrt(v)
 
     n_cont = poly_order + 1
     wave_ref = float(w.mean())
     wave_scale = max(0.5 * float(w.max() - w.min()), 1e-6)
     sigma_for_mask = sigma_fixed if sigma_fixed is not None else sigma_init
+    broad_mask = None
+    if broad_component is not None:
+        broad_sigma_for_mask = broad_sigma_fixed if broad_sigma_fixed is not None else broad_sigma_init
+        broad_mask = (LINES[broad_component] * (1 + z), broad_sigma_for_mask)
     cont_p0 = fit_continuum_polynomial(w, f, v, group_lines, z, sigma_for_mask, poly_order,
                                         wave_ref, wave_scale,
-                                        mask_halfwidth_sigma=continuum_mask_halfwidth_sigma)
+                                        mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
+                                        broad_mask=broad_mask)
 
-    model_fn, free_lines, derived, ratio_lines = build_model(
+    model_fn, free_lines, derived, ratio_lines, broad_line = build_model(
         group_lines, tie_doublets, sigma_fixed=sigma_fixed, poly_order=poly_order,
-        wave_ref=wave_ref, wave_scale=wave_scale)
+        wave_ref=wave_ref, wave_scale=wave_scale,
+        broad_component=None if broad_component is None else (broad_component, broad_sigma_fixed))
     n_amp, n_ratio = len(free_lines), len(ratio_lines)
     n_lead = 1 + n_cont + (1 if sigma_fixed is None else 0)
+    broad_sigma_free = broad_line is not None and broad_sigma_fixed is None
 
     # Ratio params start at 1.0 -- a neutral, roughly-central guess within
     # every RATIO_BOUNDS pair's [lo, hi] (both are currently [0.35, 1.5]).
@@ -1030,6 +1255,20 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
     p0 = lead_p0 + [max(np.ptp(f), 1.0)] * n_amp + [1.0] * n_ratio
     lower = lead_lower + [0.0] * n_amp + [RATIO_BOUNDS[name][1] for name in ratio_lines]
     upper = lead_upper + [np.inf] * n_amp + [RATIO_BOUNDS[name][2] for name in ratio_lines]
+
+    # Broad absorption params (see build_model's broad_component), appended
+    # at the very END of the parameter vector: [broad_sigma if free] then
+    # broad_amp, bounded (-inf, 0] -- absorption, never emission. p0 seeded
+    # with the same magnitude as the narrow lines' own amplitude guess, but
+    # negative in sign.
+    if broad_line is not None:
+        if broad_sigma_free:
+            p0 = p0 + [broad_sigma_init]
+            lower = lower + [broad_sigma_bounds[0]]
+            upper = upper + [broad_sigma_bounds[1]]
+        p0 = p0 + [-0.1 * max(np.ptp(f), 1.0)]
+        lower = lower + [-np.inf]
+        upper = upper + [0.0]
 
     try:
         popt, pcov = curve_fit(
@@ -1075,9 +1314,25 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
                    + 2 * ratio_val * amp_strong * pcov[i_amp, i_ratio])
             result["amp"][name] = ratio_val * amp_strong
             result["amp_err"][name] = np.sqrt(max(var, 0.0))
+            result["ratio"][name] = ratio_val
+            result["ratio_err"][name] = perr[i_ratio]
         else:
             result["amp"][name] = amp_fit[name]
             result["amp_err"][name] = amp_err_fit[name]
+
+    if broad_line is not None:
+        broad_idx = n_lead + n_amp + n_ratio
+        if broad_sigma_free:
+            broad_sigma_fit = popt[broad_idx]
+            broad_sigma_err_fit = perr[broad_idx]
+            broad_idx += 1
+        else:
+            broad_sigma_fit = broad_sigma_fixed
+            broad_sigma_err_fit = 0.0
+        result["broad_sigma"] = broad_sigma_fit
+        result["broad_sigma_err"] = broad_sigma_err_fit
+        result["broad_amp"] = popt[broad_idx]
+        result["broad_amp_err"] = perr[broad_idx]
 
     resid = f - model_fn(w, *popt)
     dof = max(len(w) - len(popt), 1)
@@ -1091,6 +1346,8 @@ def fit_spaxel(wave, flux, var, weight, group_lines, z, dz_max, sigma_init,
     result["cont_coeffs_err"] = cont_err
     result["wave_ref"] = wave_ref
     result["wave_scale"] = wave_scale
+    result["dof"] = dof
+    result["n_good"] = int(w.size)
     result["chi2_reduced"] = np.sum((resid / sigma_y) ** 2) / dof
     result["success"] = True
     return result
@@ -1123,7 +1380,9 @@ def select_topk_by_snr(fit_mask, snr_image, topk_frac=0.05, min_topk=1):
 
 def determine_group_sigma(wave, flux, var, weight, avail, z, dz_max, sigma_init,
                            sigma_bounds, tie_doublets, window_pad, topk_iy, topk_ix,
-                           poly_order=3, continuum_mask_halfwidth_sigma=4.0):
+                           poly_order=3, continuum_mask_halfwidth_sigma=4.0,
+                           broad_component=None, broad_sigma_init=BROAD_SIGMA_INIT_AA,
+                           broad_sigma_bounds=BROAD_SIGMA_BOUNDS_AA, clip_nsigma=5.0):
     """
     Free-sigma pre-fit at each (topk_iy[k], topk_ix[k]) spaxel individually
     (via fit_spaxel with sigma_fixed=None, i.e. the ordinary free-sigma
@@ -1131,24 +1390,42 @@ def determine_group_sigma(wave, flux, var, weight, avail, z, dz_max, sigma_init,
     can span real velocity structure (e.g. galaxy rotation) that would
     artificially broaden a naively summed spectrum.
 
-    Returns (sigma_fixed, sigma_values): sigma_fixed = float(np.median(the
-    successful fits' sigma values)), the single value fit_cube then holds
-    fixed for every spaxel in this group's main fitting pass. Returns
-    (None, empty array) if none of the pre-fits succeeded, so the caller can
-    skip the whole group.
+    broad_component: optional line name (see fit_spaxel/build_model) -- each
+    pre-fit ALSO fits a free broad_sigma/broad_amp at the same spaxel (same
+    two-stage determine-then-fix pattern as the narrow sigma, just extended
+    to the broad absorption term so both are determined from the same
+    top-S/N pre-fit pass rather than a second one).
+
+    Returns (sigma_fixed, sigma_values, broad_sigma_fixed, broad_sigma_values):
+    sigma_fixed/broad_sigma_fixed = float(np.median(the successful fits' own
+    values)), the single values fit_cube then holds fixed for every spaxel in
+    this group's main fitting pass. sigma_fixed is None (and sigma_values
+    empty) if none of the pre-fits succeeded, so the caller can skip the
+    whole group; broad_sigma_fixed/broad_sigma_values are (None, empty
+    array) whenever broad_component is None, or if it's given but none of
+    the (successful) pre-fits actually used the broad term (shouldn't
+    happen when broad_component is given, since fit_spaxel then always
+    includes it -- but guarded defensively).
     """
     sigma_values = []
+    broad_sigma_values = []
     for iy, ix in zip(topk_iy, topk_ix):
         res = fit_spaxel(wave, flux[:, iy, ix], var[:, iy, ix], weight[:, iy, ix],
                           avail, z, dz_max, sigma_init, sigma_bounds, tie_doublets,
                           window_pad=window_pad, poly_order=poly_order,
-                          continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma)
+                          continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
+                          broad_component=broad_component, broad_sigma_init=broad_sigma_init,
+                          broad_sigma_bounds=broad_sigma_bounds, clip_nsigma=clip_nsigma)
         if res["success"]:
             sigma_values.append(res["sigma"])
+            if broad_component is not None and np.isfinite(res["broad_sigma"]):
+                broad_sigma_values.append(res["broad_sigma"])
     sigma_values = np.array(sigma_values, dtype=float)
-    if sigma_values.size == 0:
-        return None, sigma_values
-    return float(np.median(sigma_values)), sigma_values
+    broad_sigma_values = np.array(broad_sigma_values, dtype=float)
+
+    sigma_fixed = float(np.median(sigma_values)) if sigma_values.size else None
+    broad_sigma_fixed = float(np.median(broad_sigma_values)) if broad_sigma_values.size else None
+    return sigma_fixed, sigma_values, broad_sigma_fixed, broad_sigma_values
 
 
 def plot_sigma_histogram(sigma_values, sigma_fixed, outdir, target_name, group_name):
@@ -1170,6 +1447,33 @@ def plot_sigma_histogram(sigma_values, sigma_fixed, outdir, target_name, group_n
                  f"(top-S/N spaxels, N={sigma_values.size})")
     ax.legend()
     out_path = os.path.join(outdir, f"{target_name}_{group_name}_sigma_hist.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+    return out_path
+
+
+def plot_broad_sigma_histogram(broad_sigma_values, broad_sigma_fixed, outdir, target_name, group_name):
+    """
+    Histogram PNG of determine_group_sigma's per-spaxel BROAD (absorption
+    Gaussian) sigma values -- same purpose/layout as plot_sigma_histogram,
+    for the broad component's own width (see build_model/GROUP_BROAD_COMPONENT).
+    A median that sits at or near BROAD_SIGMA_BOUNDS_AA's edge is a sign the
+    absorption term isn't well constrained for this target/group and the
+    fixed value shouldn't be trusted.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bins = min(20, max(5, broad_sigma_values.size))
+    ax.hist(broad_sigma_values, bins=bins, color="darkorange", edgecolor="black")
+    ax.axvline(broad_sigma_fixed, color="red", ls="--", lw=2,
+               label=f"median = {broad_sigma_fixed:.3f} Angstrom")
+    ax.set_xlabel("Fitted broad (absorption) sigma (Angstrom)")
+    ax.set_ylabel("Number of spaxels")
+    ax.set_title(f"{target_name} -- {group_name} broad sigma distribution "
+                 f"(top-S/N spaxels, N={broad_sigma_values.size})")
+    ax.legend()
+    out_path = os.path.join(outdir, f"{target_name}_{group_name}_broad_sigma_hist.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote {out_path}")
@@ -1215,6 +1519,77 @@ def plot_fit_selection_diagnostic(nb_img, fit_mask, topk_iy, topk_ix, outdir, ta
 
 
 # ----------------------------------------------------------------------
+# Per-spaxel curve_fit parallelization
+# ----------------------------------------------------------------------
+# Populated once per worker process by _init_fit_worker with the per-group
+# context (wave grid, line list, z, sigma_fixed, ...) that's IDENTICAL for
+# every spaxel in a group -- set via a pool initializer rather than repeated
+# in every task, so it's pickled/sent across the process boundary once per
+# worker (n_workers times) instead of once per spaxel (n_fit times).
+_worker_ctx = {}
+
+
+def _limit_worker_blas_threads():
+    """
+    Caps each worker to a single BLAS/OpenMP thread. Without this, numpy/
+    scipy's own internal multithreading (used by curve_fit's linear-algebra
+    steps) multiplies with n_workers process-level parallelism,
+    oversubscribing the machine's cores and making the parallel run slower
+    than serial for problems this small (a few hundred points, a handful of
+    parameters). Must be set before numpy/scipy's BLAS backend reads it,
+    i.e. as early as possible in each fresh worker process -- called from
+    _init_fit_worker, the pool's initializer.
+    """
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[var] = "1"
+
+
+def _init_fit_worker(wave, group_lines, z, dz_max, sigma_init, sigma_bounds,
+                      tie_doublets, window_pad, sigma_fixed, poly_order,
+                      continuum_mask_halfwidth_sigma, broad_component, broad_sigma_fixed,
+                      clip_nsigma):
+    """
+    ProcessPoolExecutor initializer: runs once in each freshly spawned
+    worker process, stashing this group's shared fitting context in
+    _worker_ctx so _fit_spaxel_worker's per-task payload only needs to carry
+    what's actually different per spaxel (iy, ix, flux/var/weight columns).
+    """
+    _limit_worker_blas_threads()
+    _worker_ctx.update(
+        wave=wave, group_lines=group_lines, z=z, dz_max=dz_max,
+        sigma_init=sigma_init, sigma_bounds=sigma_bounds,
+        tie_doublets=tie_doublets, window_pad=window_pad,
+        sigma_fixed=sigma_fixed, poly_order=poly_order,
+        continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
+        broad_component=broad_component, broad_sigma_fixed=broad_sigma_fixed,
+        clip_nsigma=clip_nsigma,
+    )
+
+
+def _fit_spaxel_worker(task):
+    """
+    Module-level (picklable) target for ProcessPoolExecutor.map -- unpacks
+    one spaxel's (iy, ix, flux_col, var_col, weight_col), calls fit_spaxel
+    against the context _init_fit_worker already stashed in this process,
+    and returns (iy, ix, res) so the parent can store results into the
+    pre-allocated maps regardless of completion order.
+    """
+    iy, ix, flux_col, var_col, weight_col = task
+    ctx = _worker_ctx
+    res = fit_spaxel(
+        ctx["wave"], flux_col, var_col, weight_col, ctx["group_lines"], ctx["z"],
+        ctx["dz_max"], ctx["sigma_init"], ctx["sigma_bounds"], ctx["tie_doublets"],
+        window_pad=ctx["window_pad"], sigma_fixed=ctx["sigma_fixed"],
+        poly_order=ctx["poly_order"],
+        continuum_mask_halfwidth_sigma=ctx["continuum_mask_halfwidth_sigma"],
+        broad_component=ctx["broad_component"], broad_sigma_fixed=ctx["broad_sigma_fixed"],
+        clip_nsigma=ctx["clip_nsigma"],
+    )
+    return iy, ix, res
+
+
+# ----------------------------------------------------------------------
 # Full-cube fit
 # ----------------------------------------------------------------------
 def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
@@ -1222,10 +1597,16 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
              continuum_wave_min=6400.0, continuum_wave_max=6700.0,
              wave_range=None, include_continuum=True,
              mad_sigma=2.5, narrowband_pad=30.0, sigma_topk_frac=0.05, sigma_topk_min=1,
-             continuum_poly_order=3, continuum_mask_halfwidth_sigma=4.0):
+             continuum_poly_order=3, continuum_mask_halfwidth_sigma=4.0,
+             clip_nsigma=5.0, n_workers=8):
     """
     Fit all line complexes (LINE_GROUPS) in one LLAMAS channel cube, plus
     (optionally) a broadband continuum image (see compute_broadband_continuum).
+
+    clip_nsigma: see _clip_negative_outliers -- forwarded to every
+    fit_spaxel call (both the per-group sigma pre-fit and the main
+    per-spaxel pass) to drop severe negative-outlier pixels (e.g. a
+    cosmic-ray residual) before fitting. Set to None to disable.
 
     Which lines actually get fit is determined per-group by
     available_lines() against this cube's own (possibly truncated, see
@@ -1278,9 +1659,12 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
         continuum_wave_max (e.g. a blue-channel-only fit used solely for
         [OII]) to avoid a spurious ValueError; fit_target computes the
         continuum image separately, once, from a chosen channel.
-    mad_sigma : float
+    mad_sigma : float or None
         sigma_multiplier passed to mad_background_mask for each group's
-        fit-restriction mask.
+        fit-restriction mask. None disables the restriction entirely --
+        every spaxel with finite narrowband data is fit (still excludes the
+        structurally-empty grid corners outside the hex-packed IFU
+        footprint, not a background cut).
     narrowband_pad : float
         Padding (Angstrom, each side) added to a group's bluest-to-reddest
         line span (group_wave_window) when building its narrowband image.
@@ -1293,13 +1677,29 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
     sigma_topk_frac, sigma_topk_min : float, int
         Passed to select_topk_by_snr for the sigma pre-fit's spaxel
         selection.
+    n_workers : int or None
+        Number of worker processes for the main (sigma-fixed) per-spaxel
+        fitting pass within each group -- every masked spaxel's curve_fit
+        call is independent (reads only its own spectrum, writes to a unique
+        map index), so this is embarrassingly parallel. 1 or None runs the
+        original serial loop (no pool overhead, easiest to debug); >1 uses a
+        ProcessPoolExecutor (not threads -- curve_fit is CPU-bound pure
+        Python/C and would serialize on the GIL). determine_group_sigma's
+        top-S/N pre-fit pass is NOT parallelized (it's already a small
+        subset, sigma_topk_frac of the group).
 
     Returns
     -------
     maps : dict[str, dict[str, ndarray]]
         maps[line_name] = {'flux': 2D array, 'flux_err': 2D array}
         Plus maps['_meta'][group_name] = {'sigma', 'z', 'chi2_reduced',
-        'cont0', 'cont0_err', 'cont1', 'cont1_err'}, each a 2D array
+        'dof', 'n_good', 'success', 'cont0', 'cont0_err', 'cont1',
+        'cont1_err', ... up to 'cont{continuum_poly_order}',
+        'cont{continuum_poly_order}_err', and (only for a group with a
+        density-sensitive doublet, see RATIO_BOUNDS) 'ratio_{line}',
+        'ratio_{line}_err', and (only for a group with a broad absorption
+        companion, see GROUP_BROAD_COMPONENT) 'broad_amp', 'broad_amp_err',
+        'broad_sigma'}, each a 2D array
         Plus maps['_continuum_img'] = {'flux': 2D array, 'flux_err': 2D array}
         (only if include_continuum)
         Plus maps['_metallicity'] = 2D array (see compute_metallicity_map)
@@ -1333,10 +1733,26 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
     meta = {}
 
     for group_name, group_lines in LINE_GROUPS.items():
-        avail = available_lines(group_lines, z, wave_min, wave_max, pad=window_pad / 2)
+        # A group with a broad absorption companion (see GROUP_BROAD_COMPONENT)
+        # gets a WIDER fit window than usual, so the absorption Gaussian's own
+        # wings (up to BROAD_SIGMA_BOUNDS_AA's upper edge) aren't clipped by
+        # window_pad -- determined purely from group_name, before avail, so
+        # the SAME (widened) pad is used for this group's own available_lines
+        # coverage check too (otherwise a line could pass that check against
+        # the narrower default pad, then have its actual, wider fit window
+        # reach into untrustworthy channel-edge coverage without being caught).
+        group_window_pad = window_pad + (BROAD_WINDOW_PAD_EXTRA_AA if group_name in GROUP_BROAD_COMPONENT
+                                          else 0.0)
+        avail = available_lines(group_lines, z, wave_min, wave_max, pad=group_window_pad / 2)
         print(f"[{group_name}] available lines at z={z}: {avail}")
         if not avail:
             continue
+
+        # Only keep the broad component if its own line actually made it into
+        # avail (e.g. Hbeta could still fail the channel-coverage check above).
+        broad_component_line = GROUP_BROAD_COMPONENT.get(group_name)
+        if broad_component_line is not None and broad_component_line not in avail:
+            broad_component_line = None
 
         nb_lo, nb_hi = group_wave_window(avail, z, narrowband_pad)
         try:
@@ -1345,7 +1761,14 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
             print(f"[{group_name}] no coverage for narrowband window "
                   f"[{nb_lo:.1f}, {nb_hi:.1f}], skipping group")
             continue
-        fit_mask = mad_background_mask(nb_img, sigma_multiplier=mad_sigma)
+        if mad_sigma is None:
+            # Masking disabled: fit every spaxel with real narrowband data (still
+            # excludes the structurally-empty corners of the rectangular grid
+            # outside the hex-packed IFU footprint -- NSPAXEL < ny*nx -- since
+            # there's nothing there to fit, not a background-exclusion choice).
+            fit_mask = np.isfinite(nb_img) & np.isfinite(nb_img_err) & (nb_img_err > 0)
+        else:
+            fit_mask = mad_background_mask(nb_img, sigma_multiplier=mad_sigma)
         n_fit = int(np.count_nonzero(fit_mask))
         print(f"[{group_name}] fit-restriction mask: {n_fit}/{fit_mask.size} spaxels")
         if n_fit == 0:
@@ -1356,11 +1779,12 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
             nb_sn = nb_img / nb_img_err
         topk_iy, topk_ix = select_topk_by_snr(fit_mask, nb_sn, topk_frac=sigma_topk_frac,
                                                min_topk=sigma_topk_min)
-        sigma_fixed, sigma_values = determine_group_sigma(
+        sigma_fixed, sigma_values, broad_sigma_fixed, broad_sigma_values = determine_group_sigma(
             wave, flux, var, weight, avail, z, dz_max, sigma_init, sigma_bounds,
-            tie_doublets, window_pad, topk_iy, topk_ix,
+            tie_doublets, group_window_pad, topk_iy, topk_ix,
             poly_order=continuum_poly_order,
-            continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma)
+            continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
+            broad_component=broad_component_line, clip_nsigma=clip_nsigma)
         if sigma_fixed is None:
             print(f"[{group_name}] no successful top-S/N pre-fits, skipping group")
             continue
@@ -1368,45 +1792,118 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
               f"(median of {sigma_values.size} top-S/N spaxel fits)")
         plot_sigma_histogram(sigma_values, sigma_fixed, outdir, target_name, group_name)
         plot_fit_selection_diagnostic(nb_img, fit_mask, topk_iy, topk_ix, outdir, target_name, group_name)
+        if broad_component_line is not None:
+            if broad_sigma_fixed is None:
+                print(f"[{group_name}] broad component requested but no successful "
+                      f"broad pre-fits -- proceeding WITHOUT the broad absorption term")
+                broad_component_line = None
+            else:
+                print(f"[{group_name}] broad_sigma_fixed = {broad_sigma_fixed:.4f} Angstrom "
+                      f"(median of {broad_sigma_values.size} top-S/N spaxel fits)")
+                plot_broad_sigma_histogram(broad_sigma_values, broad_sigma_fixed, outdir,
+                                            target_name, group_name)
+
+        n_cont = continuum_poly_order + 1
+        ratio_lines = [name for name in avail if name in RATIO_BOUNDS]
 
         sigma_map = np.full((ny, nx), np.nan)
         z_map = np.full((ny, nx), np.nan)
         chi2_map = np.full((ny, nx), np.nan)
-        cont0_map = np.full((ny, nx), np.nan)
-        cont0_err_map = np.full((ny, nx), np.nan)
-        cont1_map = np.full((ny, nx), np.nan)
-        cont1_err_map = np.full((ny, nx), np.nan)
+        dof_map = np.full((ny, nx), np.nan)
+        n_good_map = np.full((ny, nx), np.nan)
+        success_map = np.full((ny, nx), np.nan)
+        cont_coeff_maps = [np.full((ny, nx), np.nan) for _ in range(n_cont)]
+        cont_coeff_err_maps = [np.full((ny, nx), np.nan) for _ in range(n_cont)]
+        ratio_maps = {name: np.full((ny, nx), np.nan) for name in ratio_lines}
+        ratio_err_maps = {name: np.full((ny, nx), np.nan) for name in ratio_lines}
+        broad_amp_map = np.full((ny, nx), np.nan) if broad_component_line is not None else None
+        broad_amp_err_map = np.full((ny, nx), np.nan) if broad_component_line is not None else None
+        # broad_sigma is held FIXED at broad_sigma_fixed for every spaxel (same
+        # two-stage pattern as the narrow sigma_map), so this map is that same
+        # constant broadcast to every SUCCESSFULLY fit spaxel and NaN elsewhere
+        # -- not a full-array broadcast, to stay consistent with every other
+        # per-spaxel meta map (NaN outside fit_mask / on curve_fit failure).
+        broad_sigma_map = np.full((ny, nx), np.nan) if broad_component_line is not None else None
 
-        fit_iy, fit_ix = np.nonzero(fit_mask)
-        for k, (iy, ix) in enumerate(zip(fit_iy, fit_ix)):
-            res = fit_spaxel(
-                wave, flux[:, iy, ix], var[:, iy, ix], weight[:, iy, ix],
-                avail, z, dz_max, sigma_init, sigma_bounds, tie_doublets,
-                window_pad=window_pad, sigma_fixed=sigma_fixed,
-                poly_order=continuum_poly_order,
-                continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
-            )
+        def _store_result(iy, ix, res):
+            # success_map distinguishes "never attempted" (NaN, outside
+            # fit_mask -- this function is only ever called for fit_mask
+            # spaxels) from "attempted but curve_fit failed" (0.0) and
+            # "succeeded" (1.0); all other maps stay NaN in the failure case,
+            # same as before this spaxel was ever attempted.
+            success_map[iy, ix] = 1.0 if res["success"] else 0.0
             if not res["success"]:
-                continue
+                return
             for name in avail:
                 maps[name]["flux"][iy, ix] = res["amp"][name]
                 maps[name]["flux_err"][iy, ix] = res["amp_err"][name]
             sigma_map[iy, ix] = res["sigma"]
             z_map[iy, ix] = res["z"]
             chi2_map[iy, ix] = res["chi2_reduced"]
-            cont0_map[iy, ix] = res["cont0"]
-            cont0_err_map[iy, ix] = res["cont0_err"]
-            cont1_map[iy, ix] = res["cont1"]
-            cont1_err_map[iy, ix] = res["cont1_err"]
-            if (k + 1) % 200 == 0 or (k + 1) == n_fit:
-                print(f"  [{group_name}] spaxel {k + 1}/{n_fit} done", end="\r")
+            dof_map[iy, ix] = res["dof"]
+            n_good_map[iy, ix] = res["n_good"]
+            for i in range(n_cont):
+                cont_coeff_maps[i][iy, ix] = res["cont_coeffs"][i]
+                cont_coeff_err_maps[i][iy, ix] = res["cont_coeffs_err"][i]
+            for name in ratio_lines:
+                if name in res["ratio"]:
+                    ratio_maps[name][iy, ix] = res["ratio"][name]
+                    ratio_err_maps[name][iy, ix] = res["ratio_err"][name]
+            if broad_component_line is not None:
+                broad_amp_map[iy, ix] = res["broad_amp"]
+                broad_amp_err_map[iy, ix] = res["broad_amp_err"]
+                broad_sigma_map[iy, ix] = res["broad_sigma"]
+
+        fit_iy, fit_ix = np.nonzero(fit_mask)
+        if n_workers is not None and n_workers > 1 and n_fit > 1:
+            tasks = (
+                (iy, ix, flux[:, iy, ix], var[:, iy, ix], weight[:, iy, ix])
+                for iy, ix in zip(fit_iy, fit_ix)
+            )
+            # Amortize per-task IPC/pickling overhead across ~20 chunks per
+            # worker, rather than one round trip per spaxel.
+            chunksize = max(1, n_fit // (n_workers * 20))
+            with ProcessPoolExecutor(
+                    max_workers=n_workers, initializer=_init_fit_worker,
+                    initargs=(wave, avail, z, dz_max, sigma_init, sigma_bounds,
+                              tie_doublets, group_window_pad, sigma_fixed,
+                              continuum_poly_order, continuum_mask_halfwidth_sigma,
+                              broad_component_line, broad_sigma_fixed, clip_nsigma)) as ex:
+                for k, (iy, ix, res) in enumerate(
+                        ex.map(_fit_spaxel_worker, tasks, chunksize=chunksize)):
+                    _store_result(iy, ix, res)
+                    if (k + 1) % 200 == 0 or (k + 1) == n_fit:
+                        print(f"  [{group_name}] spaxel {k + 1}/{n_fit} done", end="\r")
+        else:
+            for k, (iy, ix) in enumerate(zip(fit_iy, fit_ix)):
+                res = fit_spaxel(
+                    wave, flux[:, iy, ix], var[:, iy, ix], weight[:, iy, ix],
+                    avail, z, dz_max, sigma_init, sigma_bounds, tie_doublets,
+                    window_pad=group_window_pad, sigma_fixed=sigma_fixed,
+                    poly_order=continuum_poly_order,
+                    continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
+                    broad_component=broad_component_line, broad_sigma_fixed=broad_sigma_fixed,
+                    clip_nsigma=clip_nsigma,
+                )
+                _store_result(iy, ix, res)
+                if (k + 1) % 200 == 0 or (k + 1) == n_fit:
+                    print(f"  [{group_name}] spaxel {k + 1}/{n_fit} done", end="\r")
         print()
 
         meta[group_name] = {
             "sigma": sigma_map, "z": z_map, "chi2_reduced": chi2_map,
-            "cont0": cont0_map, "cont0_err": cont0_err_map,
-            "cont1": cont1_map, "cont1_err": cont1_err_map,
+            "dof": dof_map, "n_good": n_good_map, "success": success_map,
         }
+        for i in range(n_cont):
+            meta[group_name][f"cont{i}"] = cont_coeff_maps[i]
+            meta[group_name][f"cont{i}_err"] = cont_coeff_err_maps[i]
+        for name in ratio_lines:
+            meta[group_name][f"ratio_{name}"] = ratio_maps[name]
+            meta[group_name][f"ratio_{name}_err"] = ratio_err_maps[name]
+        if broad_component_line is not None:
+            meta[group_name]["broad_amp"] = broad_amp_map
+            meta[group_name]["broad_amp_err"] = broad_amp_err_map
+            meta[group_name]["broad_sigma"] = broad_sigma_map
 
     maps["_meta"] = meta
     if include_continuum:
@@ -1415,6 +1912,12 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
         maps["_continuum_img"] = {"flux": cont_img, "flux_err": cont_img_err}
     maps["_metallicity"] = compute_metallicity_map(
         maps["NII_6584"]["flux"], maps["Halpha"]["flux"],
+        maps["NII_6584"]["flux_err"], maps["Halpha"]["flux_err"],
+    )
+    maps["_metallicity_o3n2"] = compute_metallicity_map_o3n2(
+        maps["OIII_5007"]["flux"], maps["Hbeta"]["flux"],
+        maps["NII_6584"]["flux"], maps["Halpha"]["flux"],
+        maps["OIII_5007"]["flux_err"], maps["Hbeta"]["flux_err"],
         maps["NII_6584"]["flux_err"], maps["Halpha"]["flux_err"],
     )
     maps["_wcs"] = wcs
@@ -1478,7 +1981,8 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
                 window_pad=60.0, continuum_channel=None,
                 continuum_wave_min=6400.0, continuum_wave_max=6700.0,
                 mad_sigma=2.5, narrowband_pad=30.0, sigma_topk_frac=0.05, sigma_topk_min=1,
-                continuum_poly_order=3, continuum_mask_halfwidth_sigma=4.0):
+                continuum_poly_order=3, continuum_mask_halfwidth_sigma=4.0,
+                clip_nsigma=5.0, n_workers=8):
     """
     Fit emission lines across one or more LLAMAS channel cubes (blue/green/
     red) for a single target and merge the results into one maps dict
@@ -1490,8 +1994,9 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
     oii_doublet/hbeta_oiii/halpha_nii are similarly each assembled
     independently, each with its own z/sigma solution (see LINE_GROUPS).
 
-    mad_sigma, narrowband_pad, sigma_topk_frac, sigma_topk_min are forwarded
-    to every fit_cube(...) call -- see there for what each controls.
+    mad_sigma, narrowband_pad, sigma_topk_frac, sigma_topk_min, clip_nsigma,
+    n_workers are forwarded to every fit_cube(...) call -- see there for what
+    each controls.
 
     Parameters
     ----------
@@ -1553,6 +2058,7 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
             sigma_topk_frac=sigma_topk_frac, sigma_topk_min=sigma_topk_min,
             continuum_poly_order=continuum_poly_order,
             continuum_mask_halfwidth_sigma=continuum_mask_halfwidth_sigma,
+            n_workers=n_workers,
         )
 
     merged = merge_channel_maps(per_channel_maps)
@@ -1564,6 +2070,12 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
 
     merged["_metallicity"] = compute_metallicity_map(
         merged["NII_6584"]["flux"], merged["Halpha"]["flux"],
+        merged["NII_6584"]["flux_err"], merged["Halpha"]["flux_err"],
+    )
+    merged["_metallicity_o3n2"] = compute_metallicity_map_o3n2(
+        merged["OIII_5007"]["flux"], merged["Hbeta"]["flux"],
+        merged["NII_6584"]["flux"], merged["Halpha"]["flux"],
+        merged["OIII_5007"]["flux_err"], merged["Hbeta"]["flux_err"],
         merged["NII_6584"]["flux_err"], merged["Halpha"]["flux_err"],
     )
     merged["_wcs"] = per_channel_maps[continuum_channel]["_wcs"]
@@ -1581,7 +2093,7 @@ def save_fits(maps, outdir, target_name):
     header2d = wcs2d.to_header()
 
     for name in LINES:
-        if np.all(np.isnan(maps[name]["flux"])):
+        if maps[name]["flux"] is None or np.all(np.isnan(maps[name]["flux"])):
             continue
         hdus.append(fits.ImageHDU(maps[name]["flux"], header=header2d, name=f"{name}_FLUX"))
         hdus.append(fits.ImageHDU(maps[name]["flux_err"], header=header2d, name=f"{name}_ERR"))
@@ -1596,6 +2108,9 @@ def save_fits(maps, outdir, target_name):
 
     if "_metallicity" in maps:
         hdus.append(fits.ImageHDU(maps["_metallicity"], header=header2d, name="METALLICITY"))
+
+    if "_metallicity_o3n2" in maps:
+        hdus.append(fits.ImageHDU(maps["_metallicity_o3n2"], header=header2d, name="METALLICITY_O3N2"))
 
     out_path = os.path.join(outdir, f"{target_name}_linemaps.fits")
     fits.HDUList(hdus).writeto(out_path, overwrite=True)
@@ -1644,6 +2159,35 @@ def add_metallicity_map(linemaps_path):
     return linemaps_path
 
 
+def add_metallicity_map_o3n2(linemaps_path):
+    """
+    Add/replace the METALLICITY_O3N2 extension in an EXISTING *_linemaps.fits
+    (or *_linemaps_corrected.fits) file from its OIII_5007_FLUX/HBETA_FLUX/
+    NII_6584_FLUX/HALPHA_FLUX extensions (see compute_metallicity_map_o3n2),
+    without re-running the per-spaxel fit. Sibling of add_metallicity_map.
+    """
+    with fits.open(linemaps_path) as hdul:
+        oiii_flux = hdul["OIII_5007_FLUX"].data.astype(float)
+        oiii_err = hdul["OIII_5007_ERR"].data.astype(float)
+        hbeta_flux = hdul["HBETA_FLUX"].data.astype(float)
+        hbeta_err = hdul["HBETA_ERR"].data.astype(float)
+        nii_flux = hdul["NII_6584_FLUX"].data.astype(float)
+        nii_err = hdul["NII_6584_ERR"].data.astype(float)
+        halpha_flux = hdul["HALPHA_FLUX"].data.astype(float)
+        halpha_err = hdul["HALPHA_ERR"].data.astype(float)
+        header2d = hdul["HALPHA_FLUX"].header.copy()
+        hdus = [hdu.copy() for hdu in hdul if hdu.name != "METALLICITY_O3N2"]
+
+    metallicity = compute_metallicity_map_o3n2(
+        oiii_flux, hbeta_flux, nii_flux, halpha_flux,
+        oiii_err, hbeta_err, nii_err, halpha_err,
+    )
+    hdus.append(fits.ImageHDU(metallicity, header=header2d, name="METALLICITY_O3N2"))
+    fits.HDUList(hdus).writeto(linemaps_path, overwrite=True)
+    print(f"Updated {linemaps_path} with METALLICITY_O3N2")
+    return linemaps_path
+
+
 def build_reference_mask(maps, reference_line=DEFAULT_REFERENCE_LINE, n_sigma=DEFAULT_MASK_SIGMA):
     """
     Boolean (ny, nx) "galaxy footprint" mask: True where reference_line is
@@ -1676,6 +2220,40 @@ def build_reference_mask(maps, reference_line=DEFAULT_REFERENCE_LINE, n_sigma=DE
     return sn >= n_sigma
 
 
+def build_reference_mask_mad(maps, reference_line=DEFAULT_REFERENCE_LINE, sigma_multiplier=2.5):
+    """
+    Alternative to build_reference_mask for a "fit-all-spaxels" run (fit_cube
+    called with mad_sigma=None, so no fit-restriction mask was ever applied):
+    a MAD-based robust background threshold (see mad_background_mask) on
+    reference_line's own FITTED flux map, rather than a per-spaxel formal S/N
+    cut (flux/flux_err >= n_sigma).
+
+    A per-spaxel Gaussian+continuum fit's formal amplitude uncertainty can be
+    dramatically underestimated relative to a cube's TRUE noise -- confirmed
+    on a KCWI/KCRM reduction, where curve_fit's own chi2_reduced sat around
+    ~120-130 for essentially every fitted spaxel (both bright and background),
+    meaning the fit's quoted per-pixel sigma understated the real residual
+    scatter by roughly sqrt(120)~11x. In that regime build_reference_mask's
+    S/N cut is useless -- "S/N" is computed from that same unreliable formal
+    error, so it passes almost every fitted spaxel regardless of whether it's
+    a real detection (confirmed: >90% of spaxels formally cleared S/N>=20).
+    mad_background_mask instead thresholds directly on the flux VALUES' own
+    robust background statistics, independent of the (possibly wrong) formal
+    per-spaxel error -- the same mechanism fit_cube's own mad_sigma
+    fit-restriction uses before fitting, applied here post-hoc as a plot-time/
+    output mask instead.
+
+    Returns None if reference_line has no valid flux in maps at all.
+    """
+    ref = maps.get(reference_line)
+    if ref is None:
+        return None
+    flux_map = ref.get("flux")
+    if flux_map is None or np.all(np.isnan(flux_map)):
+        return None
+    return mad_background_mask(flux_map, sigma_multiplier=sigma_multiplier)
+
+
 def _display_and_norm(flux_map, err_map, sn_min, galaxy_mask=None):
     """
     Build a display array (S/N-masked, NaNs zero-filled for plotting) and a
@@ -1706,15 +2284,22 @@ def _display_and_norm(flux_map, err_map, sn_min, galaxy_mask=None):
 
 
 def plot_maps(maps, outdir, target_name, sn_min=3.0, cmap="viridis", localization_csv=None,
-              reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA):
+              reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA, galaxy_mask=None):
     """
     mask_n_sigma: passed to build_reference_mask to blank non-galaxy spaxels
     (see there); pass None to disable galaxy-footprint masking entirely.
+    Ignored if galaxy_mask is given directly.
+
+    galaxy_mask: a precomputed boolean (ny, nx) mask, used as-is instead of
+    calling build_reference_mask -- e.g. build_reference_mask_mad's output,
+    for a fit-all-spaxels run where the formal per-spaxel S/N cut
+    build_reference_mask uses is unreliable (see there).
     """
     os.makedirs(outdir, exist_ok=True)
     wcs2d = maps["_wcs"].celestial
     loc = load_localization(localization_csv, target_name)
-    galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma) if mask_n_sigma is not None else None
+    if galaxy_mask is None and mask_n_sigma is not None:
+        galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma)
 
     for name in LINES:
         flux_map = maps[name]["flux"]
@@ -1753,17 +2338,23 @@ PANEL_LINES = [
 
 
 def plot_combined_panel(maps, outdir, target_name, sn_min=3.0, localization_csv=None,
-                         reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA):
+                         reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA,
+                         galaxy_mask=None):
     """
     Single 1x4 figure with [OIII]5007, Halpha, [NII]6584, [SII]6731 side by side.
 
     mask_n_sigma: passed to build_reference_mask to blank non-galaxy spaxels
     (see there); pass None to disable galaxy-footprint masking entirely.
+    Ignored if galaxy_mask is given directly.
+
+    galaxy_mask: a precomputed boolean (ny, nx) mask, used as-is instead of
+    calling build_reference_mask -- see plot_maps.
     """
     os.makedirs(outdir, exist_ok=True)
     wcs2d = maps["_wcs"].celestial
     loc = load_localization(localization_csv, target_name)
-    galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma) if mask_n_sigma is not None else None
+    if galaxy_mask is None and mask_n_sigma is not None:
+        galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma)
 
     fig, axes = plt.subplots(1, 4, figsize=(24, 6), subplot_kw={"projection": wcs2d})
     for i, (ax, (name, cmap)) in enumerate(zip(axes, PANEL_LINES)):
@@ -1802,7 +2393,8 @@ def plot_combined_panel(maps, outdir, target_name, sn_min=3.0, localization_csv=
 
 
 def plot_metallicity_map(maps, outdir, target_name, localization_csv=None,
-                          reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA):
+                          reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA,
+                          galaxy_mask=None):
     """
     2D image of the Pettini & Pagel (2004) N2 metallicity, 12+log10(O/H)
     (see compute_metallicity_map). NaN spaxels are left as NaN (rendered
@@ -1812,6 +2404,10 @@ def plot_metallicity_map(maps, outdir, target_name, localization_csv=None,
 
     mask_n_sigma: passed to build_reference_mask to blank non-galaxy spaxels
     (see there); pass None to disable galaxy-footprint masking entirely.
+    Ignored if galaxy_mask is given directly.
+
+    galaxy_mask: a precomputed boolean (ny, nx) mask, used as-is instead of
+    calling build_reference_mask -- see plot_maps.
     """
     os.makedirs(outdir, exist_ok=True)
     metallicity = maps.get("_metallicity")
@@ -1819,7 +2415,8 @@ def plot_metallicity_map(maps, outdir, target_name, localization_csv=None,
         print("[metallicity] no valid spaxels, skipping PNG")
         return None
 
-    galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma) if mask_n_sigma is not None else None
+    if galaxy_mask is None and mask_n_sigma is not None:
+        galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma)
     if galaxy_mask is not None:
         metallicity = np.where(galaxy_mask, metallicity, np.nan)
         if np.all(np.isnan(metallicity)):
@@ -1902,7 +2499,8 @@ def estimate_ellipse_metallicity(maps, loc, n_sigma=2.0, sn_min=3.0):
 
 
 def plot_metallicity_histogram(maps, outdir, target_name, localization_csv=None,
-                                reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA):
+                                reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA,
+                                galaxy_mask=None):
     """
     1D histogram of per-spaxel metallicity values (finite spaxels only), plus
     a red dashed vertical line marking the metallicity estimate at the FRB
@@ -1912,11 +2510,16 @@ def plot_metallicity_histogram(maps, outdir, target_name, localization_csv=None,
     mask_n_sigma: passed to build_reference_mask to exclude non-galaxy
     spaxels from the histogram (see there); pass None to disable
     galaxy-footprint masking entirely. Does not affect the FRB-ellipse marker
-    line, which is computed over the ellipse regardless of this mask.
+    line, which is computed over the ellipse regardless of this mask. Ignored
+    if galaxy_mask is given directly.
+
+    galaxy_mask: a precomputed boolean (ny, nx) mask, used as-is instead of
+    calling build_reference_mask -- see plot_maps.
     """
     os.makedirs(outdir, exist_ok=True)
     metallicity = maps.get("_metallicity")
-    galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma) if mask_n_sigma is not None else None
+    if galaxy_mask is None and mask_n_sigma is not None:
+        galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma)
     if metallicity is not None and galaxy_mask is not None:
         metallicity = np.where(galaxy_mask, metallicity, np.nan)
     values = metallicity[np.isfinite(metallicity)] if metallicity is not None else np.array([])
@@ -1945,6 +2548,137 @@ def plot_metallicity_histogram(maps, outdir, target_name, localization_csv=None,
     return out_path
 
 
+def plot_metallicity_map_o3n2(maps, outdir, target_name, localization_csv=None,
+                               reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA,
+                               galaxy_mask=None):
+    """
+    2D image of the Nakajima et al. (2022) O3N2 metallicity, 12+log10(O/H)
+    (see compute_metallicity_map_o3n2). Sibling of plot_metallicity_map --
+    see there for the NaN/masking conventions, identical here.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    metallicity = maps.get("_metallicity_o3n2")
+    if metallicity is None or np.all(np.isnan(metallicity)):
+        print("[metallicity_o3n2] no valid spaxels, skipping PNG")
+        return None
+
+    if galaxy_mask is None and mask_n_sigma is not None:
+        galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma)
+    if galaxy_mask is not None:
+        metallicity = np.where(galaxy_mask, metallicity, np.nan)
+        if np.all(np.isnan(metallicity)):
+            print("[metallicity_o3n2] no valid spaxels inside galaxy mask, skipping PNG")
+            return None
+
+    wcs2d = maps["_wcs"].celestial
+    loc = load_localization(localization_csv, target_name)
+    _, med, std = sigma_clipped_stats(metallicity, sigma=3.0)
+    norm = ImageNormalize(stretch=LinearStretch(), vmin=med - 3 * std, vmax=med + 3 * std)
+
+    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw={"projection": wcs2d})
+    im = ax.imshow(metallicity, origin="lower", norm=norm, cmap="viridis")
+    plt.colorbar(im, ax=ax, label="12 + log10(O/H)", pad=0.02, fraction=0.047)
+    if loc is not None:
+        add_localization_ellipse(ax, wcs2d, loc)
+    ax.set_title(f"{target_name} -- metallicity (Nakajima et al. 2022 O3N2)")
+    ax.set_xlabel("RA")
+    ax.set_ylabel("Dec")
+    ax.grid(color="lightgray", lw=0.5, ls="--")
+
+    out_path = os.path.join(outdir, f"{target_name}_metallicity_o3n2.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+    return out_path
+
+
+def estimate_ellipse_metallicity_o3n2(maps, loc, n_sigma=2.0, sn_min=3.0):
+    """
+    O3N2 sibling of estimate_ellipse_metallicity -- see there for the overall
+    scheme (S/N-weighted mean inside the FRB localization ellipse, falling
+    back to a limit if no spaxel there clears the S/N cut). The weight here
+    is min(OIII_5007, Hbeta, NII_6584, Halpha S/N) per spaxel, since all four
+    lines feed the O3N2 ratio and its reliability is set by the weakest one.
+    """
+    wcs2d = maps["_wcs"].celestial
+    metallicity = maps["_metallicity_o3n2"]
+    mask = localization_ellipse_mask(metallicity.shape, wcs2d, loc, n_sigma=n_sigma)
+    if not np.any(mask):
+        warnings.warn("FRB localization ellipse does not overlap the cube FOV; "
+                       "skipping O3N2 metallicity marker")
+        return None
+
+    oiii_flux, oiii_err = maps["OIII_5007"]["flux"][mask], maps["OIII_5007"]["flux_err"][mask]
+    hbeta_flux, hbeta_err = maps["Hbeta"]["flux"][mask], maps["Hbeta"]["flux_err"][mask]
+    nii_flux, nii_err = maps["NII_6584"]["flux"][mask], maps["NII_6584"]["flux_err"][mask]
+    halpha_flux, halpha_err = maps["Halpha"]["flux"][mask], maps["Halpha"]["flux_err"][mask]
+    z_in_ellipse = metallicity[mask]
+
+    valid = np.isfinite(z_in_ellipse)
+    if np.any(valid):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            oiii_sn = oiii_flux / oiii_err
+            hbeta_sn = hbeta_flux / hbeta_err
+            nii_sn = nii_flux / nii_err
+            halpha_sn = halpha_flux / halpha_err
+        weight = np.minimum(np.minimum(oiii_sn, hbeta_sn), np.minimum(nii_sn, halpha_sn))[valid]
+        z_value = float(np.average(z_in_ellipse[valid], weights=weight))
+        return z_value, "S/N-weighted mean (FRB ellipse)", False
+
+    oiii_err_med = np.nanmedian(oiii_err)
+    hbeta_err_med = np.nanmedian(hbeta_err)
+    nii_err_med = np.nanmedian(nii_err)
+    halpha_err_med = np.nanmedian(halpha_err)
+    meds = (oiii_err_med, hbeta_err_med, nii_err_med, halpha_err_med)
+    if not all(np.isfinite(m) and m > 0 for m in meds):
+        warnings.warn("no OIII_5007/Hbeta/NII_6584/Halpha uncertainty available in the "
+                       "FRB ellipse either; skipping O3N2 metallicity marker")
+        return None
+    limit_ratio = (3.0 * oiii_err_med / (3.0 * hbeta_err_med)) / (3.0 * nii_err_med / (3.0 * halpha_err_med))
+    z_value = _invert_o3n2(np.array([np.log10(limit_ratio)]))[0]
+    if not np.isfinite(z_value):
+        warnings.warn("O3N2 limit ratio does not invert to a valid metallicity; "
+                       "skipping O3N2 metallicity marker")
+        return None
+    return float(z_value), f"{sn_min:.0f}σ limit (FRB ellipse)", True
+
+
+def plot_metallicity_histogram_o3n2(maps, outdir, target_name, localization_csv=None,
+                                     reference_line=DEFAULT_REFERENCE_LINE, mask_n_sigma=DEFAULT_MASK_SIGMA,
+                                     galaxy_mask=None):
+    """O3N2 sibling of plot_metallicity_histogram -- see there for details."""
+    os.makedirs(outdir, exist_ok=True)
+    metallicity = maps.get("_metallicity_o3n2")
+    if galaxy_mask is None and mask_n_sigma is not None:
+        galaxy_mask = build_reference_mask(maps, reference_line, mask_n_sigma)
+    if metallicity is not None and galaxy_mask is not None:
+        metallicity = np.where(galaxy_mask, metallicity, np.nan)
+    values = metallicity[np.isfinite(metallicity)] if metallicity is not None else np.array([])
+    if values.size == 0:
+        print("[metallicity_o3n2] no valid spaxels, skipping histogram")
+        return None
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(values, bins=30, color="steelblue", edgecolor="black")
+    ax.set_xlabel("12 + log10(O/H)")
+    ax.set_ylabel("Number of spaxels")
+    ax.set_title(f"{target_name} -- per-spaxel O3N2 metallicity distribution (N={values.size})")
+
+    loc = load_localization(localization_csv, target_name)
+    if loc is not None:
+        result = estimate_ellipse_metallicity_o3n2(maps, loc)
+        if result is not None:
+            z_value, label, _is_limit = result
+            ax.axvline(z_value, color="red", ls="--", lw=2, label=label)
+            ax.legend()
+
+    out_path = os.path.join(outdir, f"{target_name}_metallicity_o3n2_hist.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+    return out_path
+
+
 def load_maps_from_fits(fits_path):
     """
     Reload flux/flux_err maps written by save_fits, without re-running the fit.
@@ -1962,6 +2696,8 @@ def load_maps_from_fits(fits_path):
                     header2d = hdul[flux_ext].header
         if "METALLICITY" in hdul:
             maps["_metallicity"] = hdul["METALLICITY"].data.astype(float)
+        if "METALLICITY_O3N2" in hdul:
+            maps["_metallicity_o3n2"] = hdul["METALLICITY_O3N2"].data.astype(float)
     maps["_wcs"] = WCS(header2d)
     return maps
 
