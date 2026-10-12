@@ -73,6 +73,14 @@ import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from matplotlib.patches import Ellipse
 
+# Bumped by hand whenever the continuum-fitting/outlier-handling machinery
+# changes in a way that could shift already-produced line fluxes (poly_order,
+# robust-fit behavior, clip thresholds, etc.) -- written into every
+# *_linemaps.fits's primary header by save_fits (see maps["_provenance"] in
+# fit_cube/fit_target) so a given FITS file's fitting config is recoverable
+# without having to track down which version of this module produced it.
+EMISSION_LINE_FITTER_VERSION = "2026.09.16"
+
 
 # ----------------------------------------------------------------------
 # Rest-frame vacuum wavelengths (Angstrom) -- single source of truth
@@ -211,6 +219,25 @@ def add_localization_ellipse(ax, wcs2d, loc, n_sigma=2.0):
     return ellipse
 
 
+def add_diameter_circle(ax, wcs2d, coord, diameter_arcsec, color):
+    """
+    Draw a circle of the given ON-SKY diameter (e.g. a PSF FWHM) centered at
+    `coord` on a WCS-projected axes -- same white-halo-behind-a-colored-
+    outline styling as add_localization_ellipse, so the two read as the same
+    visual family (a localization region vs. a PSF size) when shown
+    together, just distinguished by shape/color rather than styling.
+    """
+    x_pix, y_pix = wcs2d.world_to_pixel(coord)
+    pix_scale_arcsec = float(np.nanmean(proj_plane_pixel_scales(wcs2d))) * 3600.0
+    diameter_pix = diameter_arcsec / pix_scale_arcsec
+    circle = Ellipse((x_pix, y_pix), width=diameter_pix, height=diameter_pix, angle=0.0)
+    circle.set(edgecolor=color, facecolor="none", lw=1.5,
+               transform=ax.get_transform("pixel"), zorder=5)
+    circle.set_path_effects([pe.withStroke(linewidth=3.5, foreground="white")])
+    ax.add_patch(circle)
+    return circle
+
+
 def localization_ellipse_mask(shape, wcs2d, loc, n_sigma=2.0):
     """
     Boolean (ny, nx) mask, True for pixels whose center falls within the
@@ -346,7 +373,13 @@ def compute_broadband_continuum(cube_path, wave_min=6400.0, wave_max=6700.0):
     if not np.any(sel):
         raise ValueError(f"cube has no wavelength coverage in [{wave_min}, {wave_max}] Angstrom")
 
-    f, v, w = flux[sel], var[sel], weight[sel]
+    img, img_err = ivar_weighted_collapse(flux[sel], var[sel], weight[sel])
+    header2d = wcs.celestial.to_header()
+    return img, img_err, header2d
+
+
+def ivar_weighted_collapse(f, v, w):
+    """(weight/variance)-weighted mean of a (nwave, ny, nx) flux cube along wavelength, and its error."""
     valid = np.isfinite(f) & np.isfinite(v) & (v > 0) & (w > 0)
     safe_v = np.where(valid, v, 1.0)  # avoid divide-by-zero warnings on discarded elements
     ivar = np.where(valid, w / safe_v, 0.0)  # pipeline weight combined with inverse variance
@@ -359,9 +392,7 @@ def compute_broadband_continuum(cube_path, wave_min=6400.0, wave_max=6700.0):
     good = den > 0
     img[good] = num[good] / den[good]
     img_err[good] = np.sqrt(1.0 / den[good])
-
-    header2d = wcs.celestial.to_header()
-    return img, img_err, header2d
+    return img, img_err
 
 
 def _cube_wave_bounds(fits_path):
@@ -1922,6 +1953,23 @@ def fit_cube(cube_path, z, tie_doublets=True, dv_max_kms=300.0, outdir=".",
     )
     maps["_wcs"] = wcs
     maps["_target"] = target_name
+    # Recorded verbatim into the FITS primary header by save_fits (see
+    # EMISSION_LINE_FITTER_VERSION) so a given *_linemaps.fits's continuum-
+    # fitting config is recoverable later without tracking down which
+    # version of this module produced it. robust_n_iter/robust_clip_nsigma/
+    # robust_loss reflect current (pre-robust-fit) behavior -- 1 iteration,
+    # no robust loss -- and will pick up real values once that machinery
+    # lands, without needing another provenance-schema change.
+    maps["_provenance"] = {
+        "fitter_version": EMISSION_LINE_FITTER_VERSION,
+        "poly_order": continuum_poly_order,
+        "clip_nsigma": clip_nsigma,
+        "continuum_mask_halfwidth_sigma": continuum_mask_halfwidth_sigma,
+        "mad_sigma": mad_sigma,
+        "robust_n_iter": 1,
+        "robust_clip_nsigma": None,
+        "robust_loss": "none",
+    }
     return maps
 
 
@@ -2080,6 +2128,10 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
     )
     merged["_wcs"] = per_channel_maps[continuum_channel]["_wcs"]
     merged["_target"] = target_name
+    # Every channel was fit with the same continuum_poly_order/clip_nsigma/
+    # etc, so any channel's own _provenance (see fit_cube) is representative
+    # of the whole merged target.
+    merged["_provenance"] = per_channel_maps[continuum_channel]["_provenance"]
     return merged
 
 
@@ -2088,7 +2140,24 @@ def fit_target(cube_paths, z, sensfunc_paths=None, truncate_frac=0.5,
 # ----------------------------------------------------------------------
 def save_fits(maps, outdir, target_name):
     os.makedirs(outdir, exist_ok=True)
-    hdus = [fits.PrimaryHDU()]
+    primary = fits.PrimaryHDU()
+    # Continuum-fitting/outlier-handling provenance (see fit_cube/fit_target's
+    # own maps["_provenance"] and EMISSION_LINE_FITTER_VERSION) -- written
+    # defensively so a hand-built `maps` dict lacking "_provenance" (e.g. in
+    # a test) doesn't crash save_fits, just gets UNKNOWN/-1 placeholders.
+    prov = maps.get("_provenance", {})
+    primary.header["FITVER"] = (prov.get("fitter_version", "UNKNOWN"), "emission_line_fitter.py version")
+    primary.header["POLYORD"] = (prov.get("poly_order", -1), "Continuum polynomial order")
+    primary.header["CLIPNSIG"] = (prov.get("clip_nsigma", -1.0), "Pre-fit negative-outlier clip (MAD sigma)")
+    primary.header["CONTMASK"] = (prov.get("continuum_mask_halfwidth_sigma", -1.0),
+                                   "Continuum line-mask half-width (sigma)")
+    primary.header["MADSIG"] = (prov.get("mad_sigma", -1.0), "Fit-restriction MAD sigma multiplier")
+    primary.header["RBNITER"] = (prov.get("robust_n_iter", -1), "Stage-A robust refit iterations")
+    robust_clip = prov.get("robust_clip_nsigma")
+    primary.header["RBCLIPN"] = (robust_clip if robust_clip is not None else -1.0,
+                                  "Stage-A robust clip threshold (sigma)")
+    primary.header["RBLOSS"] = (prov.get("robust_loss", "none"), "Stage-B robust loss function")
+    hdus = [primary]
     wcs2d = maps["_wcs"].celestial
     header2d = wcs2d.to_header()
 
