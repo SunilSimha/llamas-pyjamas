@@ -4,6 +4,24 @@
 #if files cannot be found or processed correctly then the pipeline defaults to the master calibration files
 
 #==============================================================================
+# RESUME / RE-RUN CONTROL
+#==============================================================================
+# By default the pipeline RESUMES: on a re-run it reuses any intermediate
+# products already on disk and only does the work that is missing. Each stage
+# checks for its own outputs and skips when they are present:
+#   - flat pixel maps (flat/pixel_maps.fits + flat/flat_smooth_models.fits)
+#   - per-science extraction + RSS generation (*_RSS_*.fits)
+#   - fibre-to-fibre flat correction (*_FF.fits)
+#   - sky-subtraction framework (*_FF_SKYSUB.fits)
+#   - cube construction (*_cube_*.fits)
+# So if a run fails late (e.g. only cube construction), re-running picks up from
+# where it left off instead of repeating the whole reduction.
+#
+# Set clobber = true to force EVERY stage (including trace regeneration) to run
+# from scratch, ignoring any existing products. Default: false.
+# clobber = false
+
+#==============================================================================
 # BIAS CALIBRATION
 #==============================================================================
 # The pipeline requires two pre-combined master bias FITS files — one for each
@@ -20,6 +38,23 @@
 #fast_bias_file = /path/to/your/fast_master_bias.fits
 
 #==============================================================================
+# DARK CURRENT CALIBRATION (optional)
+#==============================================================================
+# Optional: a single master dark-current-rate FITS file (DN/s), created from
+# raw dark exposures using the DarkLlamas class and placed in the Dark/
+# directory, OR supplied here as a full path. Raw dark frames are taken in
+# SLOW read-mode only, so unlike bias there is no slow/fast pair — the master
+# dark is applied only to SLOW-mode frames; FAST-mode frames never get dark
+# correction. Dark correction is also optional overall — if no master dark is
+# found, dark subtraction is skipped (no fallback estimate is made).
+#
+# Default location (pipeline looks here if no path is specified below):
+#   llamas_pyjamas/Dark/master_dark.fits
+#
+# To use a custom location, uncomment and set the path below:
+#dark_file = /path/to/your/master_dark.fits
+
+#==============================================================================
 # COSMIC RAY REMOVAL
 #==============================================================================
 # Enable L.A.Cosmic cosmic ray removal before spectral extraction (default: True)
@@ -29,6 +64,50 @@ remove_cosmic_rays = True
 # Optional: custom output directory for cosmic ray mask FITS files
 # If not set, masks are saved to {extraction_output_dir}/masks/
 #mask_output_dir = /path/to/custom/mask/output
+
+#==============================================================================
+# EDGE BIAS (DC OFFSET) CORRECTION
+#==============================================================================
+# LLAMAS CCDs have no overscan region, and the per-channel bias DC level drifts
+# through the night with temperature. The afternoon master bias removes the 2D
+# fixed-pattern structure, but not this drift. This step measures a per-frame,
+# per-extension DC offset from UNILLUMINATED pixels of each science/flat frame
+# and subtracts it ON TOP of the master bias, levelling the red/green/blue
+# channels. Applied to every frame that is extracted (science + flats).
+#
+# Tier 1 (default ON): the offset is measured over the top/bottom stripes that
+# lie outside the fibre stack (pixels farther than edge_bias_min_distance from
+# any fibre), using a robust sigma-clipped median. Placeholder (missing-camera)
+# extensions are detected and skipped automatically.
+#
+# Master switch (default true). Set false to disable entirely.
+edge_bias_dc_correction = true
+# Distance in pixels from the nearest fibre for a pixel to count as an
+# unilluminated top/bottom stripe pixel (default 20).
+edge_bias_min_distance = 20
+# Minimum stripe-mask pixels required; below this the correction is skipped for
+# that extension (guards placeholders / odd geometry). Default 500.
+edge_bias_min_pixels = 500
+#
+# Tier 2 (default OFF, experimental): additionally include the dark left/right
+# dichroic-crossover / low-sensitivity zones. These vary per camera and per
+# fibre (valid-x is a function of y), so they are taken from a flat-derived,
+# per-pixel mask (flat/unillum_mask.fits, written during flat processing):
+# on-fibre pixels whose flat throughput is below edge_bias_flat_frac of that
+# fibre's own peak. Only meaningfully affects green/blue (red flats fill the
+# full detector). Turn on to A/B-test against Tier 1.
+#   NOTE: the flat mask is generated during flat processing, so enabling this on
+#   an already-reduced dataset requires re-running the flat stage (clobber = true).
+edge_bias_use_flat_mask = false
+# Flat-throughput fraction (of each fibre's peak) below which a pixel is treated
+# as unilluminated when building the flat mask (default 0.1).
+edge_bias_flat_frac = 0.1
+#
+# QA: every run writes {extraction_output_dir}/edge_bias_levels.csv with, per
+# extension, the subtracted offset (edge_dc) and BOTH candidate levels
+# (stripes-only and stripes+flat) plus WTH-TEMP and timestamp — so the nightly
+# drift and the two mask choices can be compared. Per-extension header keywords:
+# EDGEDC, EDGENPIX, EDGEDMIN, EDGESRC.
 
 #calibration files to include
 red_flat_file = /Users/slh/Library/CloudStorage/Box-Box/slhughes/testing_files/trace_flats/LLAMAS_2025-05-23T12_34_47.516_mef.fits
@@ -70,6 +149,54 @@ ray_num_cpus = 8
 # concurrency on low-RAM machines; a value larger than the available memory pool
 # will make tasks unschedulable, so keep it small (e.g. 256).
 # ray_task_memory_mb = 0
+
+# --- Scratch / temp management (optional) -----------------------------------
+# Ray writes session logs, object-store spill, and its package uploads into a
+# temp dir. By default the pipeline redirects all of that into /tmp/llamas_ray/<pid>
+# and always removes it on exit (even on failure), so /tmp no longer fills up.
+#
+# ray_temp_dir: base dir for Ray's temp output. MUST be a SHORT path (<= ~32 chars
+#   on macOS / ~36 on Linux) because Ray binds AF_UNIX sockets under it; longer
+#   paths are auto-rejected back to /tmp/llamas_ray with a warning. Point this at a
+#   short path on a LARGE volume if your /tmp is small. Default: /tmp/llamas_ray.
+# ray_temp_dir = /tmp/llamas_ray
+#
+# scratch_dir: alternate base for the temp dir if ray_temp_dir is unset (same
+#   socket-length rule applies). Default: falls back to ray_temp_dir.
+# scratch_dir = /scratch/llrs
+#
+# cleanup_scratch: remove the run's Ray scratch dir on exit (default: true). Set
+#   false to keep it for debugging (Ray is still shut down cleanly).
+# cleanup_scratch = true
+#
+# prune_ray_sessions: at startup also sweep generic /tmp/ray/session_* left by
+#   crashed prior runs (default: false; may affect other Ray apps on the machine).
+# prune_ray_sessions = false
+#
+# --- Pre-flight disk-space gate (optional) ----------------------------------
+# Before any work, the pipeline checks free space on the temp and output volumes.
+# It ABORTS immediately if space is guaranteed insufficient, and WARNS if it is
+# tight. Tune or disable here.
+# min_free_gb: hard floor of free space required to start, per volume (default 5).
+# min_free_gb = 5
+# disk_estimate_factor: multiplier on total input size used to estimate the output
+#   footprint for the warning tier (default 5). Raise if your cubes are large.
+# disk_estimate_factor = 5
+# skip_disk_check: set true to bypass the pre-flight gate entirely (default false).
+# skip_disk_check = false
+#
+# input_timeout_s: per-run budget for probing that every input file responds before
+#   starting. If a file's filesystem is unresponsive (an offline cloud mount such as
+#   Box/iCloud/Dropbox, or a dead network share), the pipeline aborts with a clear
+#   message in this many seconds instead of hanging forever in stat (default 15).
+# input_timeout_s = 15
+#
+# log_retention: keep only the newest N llamas_pipeline_*.log files (default 10).
+# log_retention = 10
+#
+# To reclaim scratch left by OLDER runs (before this fix, or after a hard kill), run:
+#   python -m llamas_pyjamas.Utils.clean_ray_scratch           # preview (dry run)
+#   python -m llamas_pyjamas.Utils.clean_ray_scratch --yes     # actually delete
 
 #==============================================================================
 # SKY SUBTRACTION FRAMEWORK

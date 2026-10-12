@@ -39,12 +39,13 @@ from pypeit.bspline.bspline import bspline
 import pickle, h5py
 import logging
 import ray
+from llamas_pyjamas.Utils.rayManager import get_ray_temp_dir, init_ray
 from typing import List, Set, Dict, Tuple, Optional
 import multiprocessing
 import argparse
 import cloudpickle
 from scipy.signal import find_peaks
-from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR
+from llamas_pyjamas.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR, DARK_DIR
 import pkg_resources
 from pathlib import Path
 import rpdb
@@ -52,6 +53,7 @@ import rpdb
 from llamas_pyjamas.File.llamasIO import process_fits_by_color
 from llamas_pyjamas.constants import idx_lookup
 from llamas_pyjamas.Bias import BiasNotFoundError, BiasReadModeError
+from llamas_pyjamas.Dark import DarkNotFoundError, DarkReadModeError
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +91,16 @@ def _grab_bias_hdu(bench=None, side=None, color=None, benchside=None,
     if not (bench and side and color):
         raise ValueError("Must provide either (bench, side, color) or (benchside, color)")
     
-    with tempfile.NamedTemporaryFile(suffix='.fits', delete=True) as _tf:
-        _tmp_path = _tf.name
-    bias_hdus, _ = process_fits_by_color(dir, output_file=_tmp_path)
+    # Write the intermediate bias FITS into the owned scratch dir and always remove it
+    # (the old NamedTemporaryFile(delete=True) pattern leaked a real .fits into /tmp).
+    _tmp_fd, _tmp_path = tempfile.mkstemp(suffix='.fits', prefix='llrs_bias_',
+                                          dir=get_ray_temp_dir())
+    os.close(_tmp_fd)
+    try:
+        bias_hdus, _ = process_fits_by_color(dir, output_file=_tmp_path)
+    finally:
+        if os.path.exists(_tmp_path):
+            os.remove(_tmp_path)
 
     if bias_hdus is None:
         # Try BIAS_DIR fallback before giving up
@@ -99,9 +108,14 @@ def _grab_bias_hdu(bench=None, side=None, color=None, benchside=None,
             calib_path = os.path.join(BIAS_DIR, f'{required_readmode.lower()}_master_bias.fits')
         else:
             calib_path = os.path.join(BIAS_DIR, 'slow_master_bias.fits')
-        with tempfile.NamedTemporaryFile(suffix='.fits', delete=True) as _tf2:
-            _tmp_path2 = _tf2.name
-        bias_hdus, _ = process_fits_by_color(calib_path, output_file=_tmp_path2)
+        _tmp_fd2, _tmp_path2 = tempfile.mkstemp(suffix='.fits', prefix='llrs_bias_',
+                                                dir=get_ray_temp_dir())
+        os.close(_tmp_fd2)
+        try:
+            bias_hdus, _ = process_fits_by_color(calib_path, output_file=_tmp_path2)
+        finally:
+            if os.path.exists(_tmp_path2):
+                os.remove(_tmp_path2)
         if bias_hdus is None:
             raise BiasNotFoundError(dir)
         logger.warning(
@@ -172,6 +186,134 @@ def _grab_bias_hdu(bench=None, side=None, color=None, benchside=None,
     return bias_hdu
 
 
+def _grab_dark_hdu(bench=None, side=None, color=None, benchside=None,
+                   dir=os.path.join(DARK_DIR, 'master_dark.fits'),
+                   required_readmode=None) -> fits.ImageHDU:
+    """
+    Retrieves the appropriate master-dark-rate HDU (DN/s) from the combined
+    dark file, mirroring ``_grab_bias_hdu`` exactly (same orientation
+    transform, same header-then-CAM_NAME-then-index matching fallback chain).
+
+    Unlike bias, there is only a single master dark file (raw dark exposures
+    are taken in SLOW read-mode only). ``required_readmode`` is still checked
+    against the file's own READ-MDE header as a safety net — a caller that
+    passes ``required_readmode='FAST'`` will correctly get a
+    DarkReadModeError rather than a silently wrong correction.
+
+    Args:
+        bench (str, optional): Bench identifier (e.g., '1', '2', '3', '4').
+        side (str, optional): Side identifier (e.g., 'A', 'B').
+        color (str, optional): Color channel (e.g., 'red', 'green', 'blue').
+        benchside (str, optional): Combined bench and side (e.g., '1A', '4B').
+        dir (str, optional): Path to the combined master dark file.
+        required_readmode (str, optional): READ-MDE the dark file must match.
+
+    Returns:
+        fits.ImageHDU: The master-dark HDU for the specified detector.
+
+    Raises:
+        ValueError: If the combination of parameters is invalid or incomplete.
+        DarkNotFoundError: If the dark file cannot be read.
+        DarkReadModeError: If required_readmode does not match the file's READ-MDE.
+    """
+    if benchside and not (bench and side):
+        if len(benchside) != 2:
+            raise ValueError(f"Invalid benchside format: {benchside}. Expected format: 'NX' where N is bench number and X is side letter.")
+        bench = benchside[0]
+        side = benchside[1]
+
+    if not (bench and side and color):
+        raise ValueError("Must provide either (bench, side, color) or (benchside, color)")
+
+    _tmp_fd, _tmp_path = tempfile.mkstemp(suffix='.fits', prefix='llrs_dark_',
+                                          dir=get_ray_temp_dir())
+    os.close(_tmp_fd)
+    try:
+        dark_hdus, _ = process_fits_by_color(dir, output_file=_tmp_path)
+    finally:
+        if os.path.exists(_tmp_path):
+            os.remove(_tmp_path)
+
+    if dark_hdus is None:
+        calib_path = os.path.join(DARK_DIR, 'master_dark.fits')
+        _tmp_fd2, _tmp_path2 = tempfile.mkstemp(suffix='.fits', prefix='llrs_dark_',
+                                                dir=get_ray_temp_dir())
+        os.close(_tmp_fd2)
+        try:
+            dark_hdus, _ = process_fits_by_color(calib_path, output_file=_tmp_path2)
+        finally:
+            if os.path.exists(_tmp_path2):
+                os.remove(_tmp_path2)
+        if dark_hdus is None:
+            raise DarkNotFoundError(dir)
+        logger.warning(
+            f"Dark file '{dir}' unreadable; using DARK_DIR fallback '{calib_path}'"
+        )
+
+    # Read-mode mismatch check
+    if required_readmode is not None:
+        dark_mode = dark_hdus[0].header.get('READ-MDE', None)
+        if dark_mode is not None and dark_mode.strip().upper() != required_readmode.upper():
+            raise DarkReadModeError(required_readmode, dark_mode, dir)
+
+    # First try to match by header keywords (robust to non-standard extension order)
+    target_color = color.lower()
+    target_bench = str(bench)
+    target_side = side.upper()
+    for hdu in dark_hdus[1:]:
+        hdr = hdu.header
+        if 'COLOR' in hdr and 'BENCH' in hdr and 'SIDE' in hdr:
+            if (str(hdr['BENCH']) == target_bench and
+                str(hdr['SIDE']).upper() == target_side and
+                str(hdr['COLOR']).lower() == target_color):
+                logger.info(
+                    f"Dark HDU matched by header: {target_bench}{target_side} {target_color}"
+                )
+                return hdu
+        elif 'CAM_NAME' in hdr:
+            camname = hdr['CAM_NAME']
+            cam_color = camname.split('_')[1].lower()
+            cam_bench = camname.split('_')[0][0]
+            cam_side = camname.split('_')[0][1].upper()
+            if cam_color == target_color and cam_bench == target_bench and cam_side == target_side:
+                logger.info(
+                    f"Dark HDU matched by CAM_NAME: {target_bench}{target_side} {target_color}"
+                )
+                return hdu
+
+    # Fall back to standard index lookup if header match fails
+    try:
+        dark_idx = idx_lookup.get((target_color, target_bench, target_side))
+        print(f"Dark index: {dark_idx} for {bench}/{side}/{color}")
+    except Exception:
+        raise ValueError(f"Invalid bench/side/color combination: {bench}/{side}/{color}")
+
+    if dark_idx is None or dark_idx >= len(dark_hdus):
+        raise ValueError(
+            f"Dark index lookup failed for {bench}/{side}/{color} in file {dir}"
+        )
+
+    logger.warning(
+        f"Dark HDU matched by index only (header match failed): {target_bench}{target_side} {target_color}"
+    )
+    dark_hdu = dark_hdus[dark_idx]
+
+    # Verify the index-matched HDU actually corresponds to the requested camera
+    hdr = dark_hdu.header
+    matched_color = hdr.get('COLOR', '').lower() if 'COLOR' in hdr else None
+    matched_bench = str(hdr.get('BENCH', '')) if 'BENCH' in hdr else None
+    matched_side = hdr.get('SIDE', '').upper() if 'SIDE' in hdr else None
+
+    if matched_color != target_color or matched_bench != target_bench or matched_side != target_side:
+        raise ValueError(
+            f"Dark index lookup returned wrong camera for {target_bench}{target_side} {target_color}: "
+            f"got {matched_bench}{matched_side} {matched_color} at index {dark_idx}. "
+            f"The dark file may have missing extensions — validate it first."
+        )
+
+    return dark_hdu
+
+
 
 def check_fibre_number(fibre_number: int, benchside: str) -> bool:
     """
@@ -208,8 +350,100 @@ def check_fibre_number(fibre_number: int, benchside: str) -> bool:
     if fibre_number > N_allowed:
         logger.warning(f'Fibre number {fibre_number} is out of range for benchside {benchside}.')
         allowed = False
-    
+
     return allowed
+
+
+def drop_spacing_outliers(indices, mid_positions, expected_count, benchside='') -> np.ndarray:
+    """Trim ``indices`` to ``expected_count`` by removing the most ISOLATED traces.
+
+    Fibres form an evenly spaced comb (pitch ~6.5 px), so every real trace --
+    including the one at either end of the slit -- has a neighbour about one
+    pitch away.  A spurious peak (detector-edge artifact) sits several pitches
+    from anything else.  Repeatedly dropping the trace with the largest
+    nearest-neighbour distance therefore removes ghosts and never the genuine
+    end fibre.
+
+    This replaces an earlier rule that trimmed by distance to the detector edge.
+    That rule dropped the REAL end-of-slit fibre and kept the ghost whenever the
+    ghost happened to sit marginally further from the opposite edge (3B: real
+    fibre at y=44.9 vs ghost at y=1997.3 -> edge scores 44.9 vs 50.7), which
+    shifted every fibre index by one for the whole bench.
+    """
+    keep = [int(i) for i in np.asarray(indices).ravel()]
+    excess = len(keep) - int(expected_count)
+
+    for _ in range(max(0, excess)):
+        pos = np.asarray([mid_positions[i] for i in keep], dtype=float)
+        order = np.argsort(pos)
+        p = pos[order]
+        if p.size < 2:
+            break
+        gaps = np.diff(p)
+        pitch = float(np.median(gaps))
+        # distance to the nearest neighbour on either side
+        nn = np.minimum(np.concatenate(([np.inf], gaps)),
+                        np.concatenate((gaps, [np.inf])))
+        worst = int(np.argmax(nn))
+        ratio = nn[worst] / pitch if pitch > 0 else float('nan')
+        if ratio < 1.5:
+            # No clear ghost: the comb is regular but still over-count. Dropping
+            # any trace here is a guess, so say so rather than silently shifting.
+            logger.warning(
+                "traceLlamas %s: %d traces vs %d expected but no isolated "
+                "outlier (worst neighbour gap %.1fx pitch) -- trim is ambiguous",
+                benchside, len(keep), int(expected_count), ratio)
+        else:
+            logger.info(
+                "traceLlamas %s: dropping isolated trace at y=%.1f "
+                "(nearest neighbour %.1f px = %.1fx pitch %.2f) as a ghost",
+                benchside, p[worst], nn[worst], ratio, pitch)
+        keep.remove(keep[order[worst]])
+
+    return np.sort(np.asarray(keep, dtype=int))
+
+
+def validate_trace_comb(mid_positions, benchside, dead_fibers=None,
+                        expected_count=None) -> bool:
+    """Check the traced fibre comb is regular; warn (loudly) if it is not.
+
+    A healthy comb has every gap ~= the median pitch, except at a genuinely dead
+    fibre (which leaves a ~2x gap).  Anything else means a fibre was missed or a
+    spurious peak was traced -- which silently misindexes every fibre after it
+    and lands their flux on the wrong sky position.  Dead fibres at either END
+    of the slit leave no gap, so ``n_big <= n_dead`` is fine; more big gaps than
+    dead fibres is not.
+    """
+    pos = np.sort(np.asarray([p for p in np.asarray(mid_positions).ravel()
+                              if p is not None and np.isfinite(p)], dtype=float))
+    if pos.size < 2:
+        logger.warning("traceLlamas %s: too few traces (%d) to validate comb",
+                       benchside, pos.size)
+        return False
+
+    gaps = np.diff(pos)
+    pitch = float(np.median(gaps))
+    n_dead = len(dead_fibers or [])
+    big = np.where(gaps > 1.5 * pitch)[0]
+    ok = True
+
+    if len(big) > n_dead:
+        ok = False
+        detail = ", ".join(f"y={pos[i]:.1f}(+{gaps[i]/pitch:.1f}x)" for i in big[:6])
+        logger.warning(
+            "traceLlamas %s: comb has %d gaps >1.5x pitch but only %d known dead "
+            "fibre(s) -- a fibre was missed or a ghost traced; fibre indices may "
+            "be shifted. Gaps at: %s", benchside, len(big), n_dead, detail)
+
+    if expected_count is not None and pos.size != int(expected_count):
+        ok = False
+        logger.warning("traceLlamas %s: traced %d fibres, expected %d",
+                       benchside, pos.size, int(expected_count))
+
+    if ok:
+        logger.info("traceLlamas %s: comb OK (%d fibres, pitch %.2f px, "
+                    "%d dead-fibre gap(s))", benchside, pos.size, pitch, len(big))
+    return ok
 
 
 
@@ -582,22 +816,29 @@ class TraceLlamas:
             #finding the inital comb for the data we are trying to fit
             
             ######New code to subtract background from the data
-            if use_bias:
-                if os.path.isfile(use_bias):
-                    bias_file = use_bias
-                else:
-                    logger.error(f"Bias file '{use_bias}' is not a valid file. Using fallback file from {os.path.join(BIAS_DIR, 'slow_master_bias.fits')}")
-                    bias_file = os.path.join(BIAS_DIR, 'slow_master_bias.fits')
+            # Guard against double subtraction: frames preprocessed by the
+            # bias-first step (Bias/biasFirst.py) arrive with BIASSUB set and
+            # are already fully bias- and edge-DC-corrected.
+            if self.hdr.get('BIASSUB', False):
+                logger.info(f"BIASSUB already set for {self.benchside} {self.channel} "
+                            f"— skipping trace-time bias subtraction")
             else:
-                bias_file = os.path.join(BIAS_DIR, 'slow_master_bias.fits')
-            print(f'Bias file: {bias_file}')
-            #### fix the directory here!
-            bias = _grab_bias_hdu(bench=self.bench, side=self.side, color=self.channel, dir=bias_file)
-            
-            #should we be using the whole bias or just an overscan region?
-            bias_data = np.median(bias.data[20:50])
-            
-            self.data = self.data - bias_data
+                if use_bias:
+                    if os.path.isfile(use_bias):
+                        bias_file = use_bias
+                    else:
+                        logger.error(f"Bias file '{use_bias}' is not a valid file. Using fallback file from {os.path.join(BIAS_DIR, 'slow_master_bias.fits')}")
+                        bias_file = os.path.join(BIAS_DIR, 'slow_master_bias.fits')
+                else:
+                    bias_file = os.path.join(BIAS_DIR, 'slow_master_bias.fits')
+                print(f'Bias file: {bias_file}')
+                #### fix the directory here!
+                bias = _grab_bias_hdu(bench=self.bench, side=self.side, color=self.channel, dir=bias_file)
+
+                #should we be using the whole bias or just an overscan region?
+                bias_data = np.median(bias.data[20:50])
+
+                self.data = self.data - bias_data
 
             self.comb = self.find_comb(rownum=self.naxis1/2)
             
@@ -746,18 +987,15 @@ class TraceLlamas:
                 # Decide how to handle this situation. For example, you might use all valid edges:
                 keep_indices = valid_edge_indices
             else:
-                # Now, for the traces that remain, calculate edge proximity scores.
-                valid_traces = self.traces[valid_edge_indices]
-                valid_mid_positions = mid_positions[valid_edge_indices]
-                edge_scores = np.array([
-                    min(pos, self.naxis2 - pos) for pos in valid_mid_positions
-                ])
-
-                # Sort traces by their edge scores (descending keeps those furthest from edges)
-                sorted_valid_indices = valid_edge_indices[np.argsort(edge_scores)[::-1]]
-
-                # Keep only the expected number of traces from the remaining valid traces.
-                keep_indices = np.sort(sorted_valid_indices[:expected_count])
+                # Trim any excess by removing SPACING OUTLIERS (ghost peaks), never
+                # by distance to the detector edge: a real end-of-slit fibre still
+                # has a neighbour one pitch away, while a ghost sits several
+                # pitches from anything. The old edge-distance rule sacrificed the
+                # real end fibre to keep a ghost on 3B/4A, shifting every fibre
+                # index by one for the whole bench.
+                keep_indices = drop_spacing_outliers(
+                    valid_edge_indices, safe_mid_positions, expected_count,
+                    benchside=self.benchside)
 
             # Now filter the trace arrays using the final indices.
             self.traces = self.traces[keep_indices]
@@ -765,7 +1003,15 @@ class TraceLlamas:
             self.xtracefit = self.xtracefit[keep_indices]
             self.nfibers = len(self.traces)
             print(f"Filtered to {self.nfibers} traces for {self.benchside} after edge trimming.")
-                 
+
+            # A mis-trimmed comb misindexes every fibre after the gap and puts its
+            # flux at the wrong sky position, so check it explicitly rather than
+            # trusting the count alone (the 3B/4A off-by-one kept nfibers=300).
+            validate_trace_comb(
+                self.traces[:, mid_x], self.benchside,
+                dead_fibers=(getattr(self, 'dead_fibres', None) or {}).get(self.benchside, []),
+                expected_count=expected_count)
+
 
         except Exception as e:
             tb = traceback.extract_tb(e.__traceback__)
@@ -968,24 +1214,10 @@ def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = CALIB_DIR
 
     NUMBER_OF_CORES = int(os.environ.get('LLAMAS_RAY_CPUS', multiprocessing.cpu_count()))
 
-    import pkg_resources as _pkgr, shutil as _shutil, glob as _glob2
-    _package_path = _pkgr.resource_filename('llamas_pyjamas', '')
-    _package_root = os.path.dirname(_package_path)
-    for _stale in _glob2.glob('/tmp/ray/session_*/runtime_resources/py_modules_files'):
-        _shutil.rmtree(_stale, ignore_errors=True)
-    _runtime_env = {
-        "working_dir": _package_root,
-        "env_vars": {"PYTHONPATH": f"{_package_root}:{os.environ.get('PYTHONPATH', '')}"},
-        "excludes": [
-            "**/*.fits", "**/*.pkl", "**/.git/**",
-            "**/*.zip/**", "**/*.tar.gz/**", "**/mastercalib*/**", "**/*.zip",
-            "**/reduced/**", "**/extractions/**", "**/cubes/**", "**/traces/**",
-            "**/testing/**",
-        ],
-    }
-
-    ray.shutdown()  # Clear any existing Ray instances
-    ray.init(ignore_reinit_error=True, num_cpus=NUMBER_OF_CORES, runtime_env=_runtime_env)
+    # Attach to (or start) the one consolidated Ray session (see Utils/rayManager.py):
+    # canonical py_modules runtime_env, object store clamped, temp/spill in the owned
+    # scratch dir. In the pipeline this attaches to the session reduce.py started.
+    init_ray(num_cpus=NUMBER_OF_CORES)
 
     print(f"\nStarting with {NUMBER_OF_CORES} cores available")
     print(f"Current CPU Usage: {psutil.cpu_percent(interval=1)}%")
@@ -1062,9 +1294,9 @@ def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = CALIB_DIR
         
     print(f"\nAll {total_jobs} jobs complete")
     print(f"Final CPU Usage: {psutil.cpu_percent(percpu=True)}%")
-    
-    ray.shutdown()
-    
+
+    # No ray.shutdown() here: the run shares one session managed by rayManager
+    # (torn down once at pipeline end via cleanup_scratch / atexit).
     return
     
     

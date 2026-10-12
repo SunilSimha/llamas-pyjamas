@@ -322,8 +322,9 @@ def compute_fibre_flat_lamp_only(smooth_models_file, output_dir):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def reduce_twilight_flat(twilight_file, p2p_map_file, trace_dir, arc_soln,
-                         slow_bias, output_dir, fast_bias=None):
-    """Reduce a twilight flat: bias/P2P correct, extract, wavelength calibrate.
+                         slow_bias, output_dir, fast_bias=None, edge_bias=None,
+                         dark_file=None):
+    """Reduce a twilight flat: bias/dark/P2P correct, extract, wavelength calibrate.
 
     Reuses existing pipeline infrastructure for each step.
 
@@ -343,6 +344,8 @@ def reduce_twilight_flat(twilight_file, p2p_map_file, trace_dir, arc_soln,
         Output directory for intermediates.
     fast_bias : str or None
         Path to FAST-mode master bias FITS file.
+    dark_file : str or None
+        Path to the (SLOW-mode-only) master dark FITS file.
 
     Returns
     -------
@@ -369,8 +372,9 @@ def reduce_twilight_flat(twilight_file, p2p_map_file, trace_dir, arc_soln,
     logger.info("Twilight: extracting 1D spectra using lamp traces")
     extraction_file = run_extraction(
         corrected_file, twi_output_dir,
-        slow_bias=slow_bias, fast_bias=fast_bias, trace_dir=trace_dir,
-        remove_cosmic_rays=False)
+        slow_bias=slow_bias, fast_bias=fast_bias,
+        dark_file=dark_file, trace_dir=trace_dir,
+        remove_cosmic_rays=False, edge_bias=edge_bias)
     logger.info(f"Twilight extraction: {extraction_file}")
 
     # Step 3: Wavelength calibration
