@@ -90,6 +90,7 @@ from scipy.signal import correlate2d
 from scipy.ndimage import label as _ndi_label
 from reproject import reproject_interp
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 
 # ----------------------------------------------------------------------
@@ -1013,12 +1014,608 @@ def correct_cube(cube_path, corrected_linemaps_path, outdir=None, cube_label="gr
 
 
 # ----------------------------------------------------------------------
+# Line-to-line registration (Hbeta/[OIII] -> Halpha grid)
+# ----------------------------------------------------------------------
+# Lines fitted from the SAME cube are not necessarily registered to one
+# another on the sky. On FRB20240210A, cross-correlating each line's flux map
+# against Halpha's puts Hbeta ~0.87" East (2.9 px) and [OIII] ~0.80" East of
+# it, while [NII]/[SII] sit at ~0 (redux/line_offset_diagnostic.py). Any
+# ratio formed at identical array indices (O3N2, BPT) then pairs
+# misregistered lines. The functions below measure that offset and resample
+# the affected line maps / cube slabs onto the Halpha grid.
+#
+# Conventions (all verified numerically in Test/test_line_offset_registration.py,
+# not assumed):
+#   * shift_x/shift_y are in REFERENCE-grid pixels, and mean: the line's
+#     features sit at (reference position + shift). A line that is East of
+#     Halpha therefore has a shift toward -x on the standard East-left grid.
+#   * Correcting = sampling the source at (reference pixel + shift), i.e. new(p) =
+#     src(p + shift). The shift is applied in reference-pixel space BEFORE the
+#     reference->source WCS mapping, so it stays exact when the two grids
+#     differ in scale/orientation (FRB20250316A's KCWI vs KCRM cubes).
+_W_EPS = 1e-6  # bilinear neighbours weighted below this do not count (see _bilinear_gather)
+_MIN_VALID_WEIGHT = 0.5  # an output pixel needs at least this fraction of its bilinear weight on valid neighbours
+
+
+def parabolic_subpixel_peak(corr_map, peak_y, peak_x):
+    """
+    3-point parabolic interpolation of a correlation peak along each axis
+    independently, centred on the integer peak (peak_y, peak_x) that
+    cross_correlate_to_reference already located. Returns (dx, dy) sub-pixel
+    corrections, 0 on any axis where the peak sits on corr_map's own edge
+    (no neighbour on one side to fit through). cross_correlate_to_reference's
+    own peak is integer-pixel only, which at 0.3"/pix would hide a sub-pixel
+    offset entirely.
+    """
+    ny, nx = corr_map.shape
+
+    def parab(v_m1, v_0, v_p1):
+        denom = v_m1 - 2 * v_0 + v_p1
+        return 0.0 if denom == 0 else 0.5 * (v_m1 - v_p1) / denom
+
+    dx = parab(corr_map[peak_y, peak_x - 1], corr_map[peak_y, peak_x], corr_map[peak_y, peak_x + 1]) \
+        if 0 < peak_x < nx - 1 else 0.0
+    dy = parab(corr_map[peak_y - 1, peak_x], corr_map[peak_y, peak_x], corr_map[peak_y + 1, peak_x]) \
+        if 0 < peak_y < ny - 1 else 0.0
+    return dx, dy
+
+
+def _shift_to_east_north_arcsec(ref_wcs, ref_shape, shift_x, shift_y):
+    """(East, North) tangent-plane separation in arcsec of a pixel shift at the reference grid's centre."""
+    ny, nx = ref_shape
+    centre = ((nx - 1) / 2.0, (ny - 1) / 2.0)
+    a = ref_wcs.pixel_to_world(*centre)
+    b = ref_wcs.pixel_to_world(centre[0] + shift_x, centre[1] + shift_y)
+    sep = a.separation(b).arcsec
+    if sep == 0.0:
+        return 0.0, 0.0
+    pa = a.position_angle(b).rad  # East of North
+    return sep * np.sin(pa), sep * np.cos(pa)
+
+
+def _refined_shift(result, ref_shape):
+    """Integer correlation peak from cross_correlate_to_reference + parabolic sub-pixel refinement."""
+    ny_ref, nx_ref = ref_shape
+    peak_y = int(round(result["shift_y"] + (ny_ref - 1)))
+    peak_x = int(round(result["shift_x"] + (nx_ref - 1)))
+    dx, dy = parabolic_subpixel_peak(result["corr_map"], peak_y, peak_x)
+    return result["shift_x"] + dx, result["shift_y"] + dy
+
+
+def measure_line_offset(line_flux, line_wcs, ref_flux, ref_wcs, search_radius_arcsec=5.0,
+                         bg_sigma_multiplier=3.0, agree_tol_pix=1.0, compute_global=True):
+    """
+    Sub-pixel offset of a line's flux map relative to a reference line's
+    (normally Hbeta relative to Halpha), by 2D cross-correlation via
+    cross_correlate_to_reference.
+
+    Two solutions are computed: a WINDOWED one (peak searched only within
+    search_radius_arcsec of zero shift -- the one returned as the answer, since
+    a global argmax on a clumpy host can lock onto a different clump) and the
+    plain GLOBAL one, reported so a disagreement is visible. 'agree' is False,
+    and a warning is added, when the two differ by more than agree_tol_pix.
+
+    Deliberately does NOT use cross_correlate_to_reference's peak_significance
+    (returned only for information): 'full'-mode correlation surfaces are
+    mostly exact-zero padding, so their MAD is ~0 and that number is
+    astronomically large (inf, or 1e4-1e5) regardless of how good the match
+    is. Judge a measurement by 'agree', the window-edge flag, and by
+    re-measuring after applying it.
+
+    line_flux/ref_flux may live on different WCSs/grids (FRB20250316A's KCWI vs
+    KCRM cubes); the correlation reprojects the line onto the reference grid.
+
+    compute_global=False skips the global solution (about half the cost):
+    the global_* outputs are NaN and 'agree' is reported True. Meant for the
+    many replicate measurements in estimate_offset_uncertainty.
+
+    Returns a dict: shift_x_pix, shift_y_pix (reference pixels, see the
+    section note for the sign), d_east_arcsec, d_north_arcsec, the same four
+    for the global solution (global_*), agree, peak_significance, warnings.
+    """
+    ref_shape = ref_flux.shape
+    pix_scale_arcsec = float(np.nanmean(proj_plane_pixel_scales(ref_wcs))) * 3600.0
+    radius_pix = search_radius_arcsec / pix_scale_arcsec
+
+    res_window = cross_correlate_to_reference(line_flux, line_wcs, ref_flux, ref_wcs,
+                                              bg_sigma_multiplier=bg_sigma_multiplier,
+                                              search_center_shift=(0.0, 0.0),
+                                              search_radius_pix=radius_pix)
+    wx, wy = _refined_shift(res_window, ref_shape)
+    w_e, w_n = _shift_to_east_north_arcsec(ref_wcs, ref_shape, wx, wy)
+    warn_list = list(res_window["warnings"])
+
+    if compute_global:
+        res_global = cross_correlate_to_reference(line_flux, line_wcs, ref_flux, ref_wcs,
+                                                  bg_sigma_multiplier=bg_sigma_multiplier)
+        gx, gy = _refined_shift(res_global, ref_shape)
+        g_e, g_n = _shift_to_east_north_arcsec(ref_wcs, ref_shape, gx, gy)
+    else:
+        gx = gy = g_e = g_n = float("nan")
+    separation_pix = float(np.hypot(wx - gx, wy - gy)) if compute_global else 0.0
+    agree = separation_pix <= agree_tol_pix
+    if not agree:
+        warn_list.append(f"windowed ({wx:+.2f},{wy:+.2f}) and global ({gx:+.2f},{gy:+.2f}) px solutions "
+                         f"differ by {separation_pix:.2f} px > {agree_tol_pix:.2f}")
+    if np.hypot(wx, wy) > radius_pix - 1.0:
+        warn_list.append(f"windowed peak ({wx:+.2f},{wy:+.2f}) px is within 1 px of the "
+                         f"{search_radius_arcsec:.1f} arcsec search-window edge; the true peak may lie outside it")
+
+    return dict(shift_x_pix=wx, shift_y_pix=wy, d_east_arcsec=w_e, d_north_arcsec=w_n,
+                global_shift_x_pix=gx, global_shift_y_pix=gy,
+                global_d_east_arcsec=g_e, global_d_north_arcsec=g_n,
+                agree=agree, peak_significance=res_window["peak_significance"], warnings=warn_list)
+
+
+DIHEDRAL_NAMES = ("identity", "flip_y", "flip_x", "rot180", "transpose", "rot90", "rot270", "anti_transpose")
+
+
+def apply_dihedral(a, name):
+    """
+    One of the 8 dihedral transforms (flips, 90-degree rotations, transpose,
+    anti-transpose) applied to the LAST TWO axes of `a` -- so a 2D map and a
+    (nwave, ny, nx) cube get the identical spatial transform. rot90/rot270 are
+    counter-clockwise (np.rot90); anti_transpose = transpose then 180 degrees.
+    """
+    a = np.asarray(a)
+    if name == "identity":
+        out = a
+    elif name == "flip_y":
+        out = np.flip(a, axis=-2)
+    elif name == "flip_x":
+        out = np.flip(a, axis=-1)
+    elif name == "rot180":
+        out = np.flip(a, axis=(-2, -1))
+    elif name == "transpose":
+        out = np.swapaxes(a, -2, -1)
+    elif name == "rot90":
+        out = np.rot90(a, 1, axes=(-2, -1))
+    elif name == "rot270":
+        out = np.rot90(a, 3, axes=(-2, -1))
+    elif name == "anti_transpose":
+        out = np.rot90(np.swapaxes(a, -2, -1), 2, axes=(-2, -1))
+    else:
+        raise ValueError(f"unknown dihedral transform {name!r}; expected one of {DIHEDRAL_NAMES}")
+    return np.ascontiguousarray(out)
+
+
+def find_dihedral_match(image, reference, min_pearson=0.98, ambiguity_margin=0.1):
+    """
+    Which of the 8 dihedral transforms puts a raw-frame map (e.g. a cube's
+    collapsed continuum) onto a reference map (e.g. the linemaps'
+    CONTINUUM_IMG) pixel-for-pixel. Returns (name, pearson_r, all_scores).
+
+    Needed because a combined cube's spatial axes are NOT in a fixed relation
+    to its target's linemaps: measured, plain transpose for FRB20250227A/
+    FRB20240312D but anti-transpose for FRB20240210A/FRB20211127I (r = 1.0000
+    in each case), and the linemaps files carry no WCSFLIP/WCSROT keys to say
+    which. Deriving it per target from the data, and requiring a unique
+    match, is what makes the transform trustworthy.
+
+    Raises ValueError if no transform reaches min_pearson (the two maps are
+    not the same data/window, or the shapes are incompatible) or if the best
+    is not clearly ahead of the runner-up by ambiguity_margin (a symmetric
+    image cannot fix an orientation).
+    """
+    reference = np.asarray(reference, dtype=np.float64)
+    scores = {}
+    for name in DIHEDRAL_NAMES:
+        v = apply_dihedral(np.asarray(image, dtype=np.float64), name)
+        if v.shape != reference.shape:
+            continue
+        m = np.isfinite(v) & np.isfinite(reference)
+        if m.sum() >= 10 and np.std(v[m]) > 0 and np.std(reference[m]) > 0:
+            scores[name] = float(np.corrcoef(v[m], reference[m])[0, 1])
+    if not scores:
+        raise ValueError(f"no dihedral transform of a {np.shape(image)} map gives shape {reference.shape}")
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    (best, r_best), runner = ranked[0], (ranked[1][1] if len(ranked) > 1 else -1.0)
+    if r_best < min_pearson:
+        raise ValueError(f"best dihedral match {best!r} has r = {r_best:.3f} < {min_pearson}: {scores}")
+    if r_best - runner < ambiguity_margin:
+        raise ValueError(f"ambiguous orientation: {best!r} r = {r_best:.3f} vs runner-up r = {runner:.3f}")
+    return best, r_best, scores
+
+
+def _replicate_offset(line, ref, ref_wcs, search_radius_arcsec, bg_sigma_multiplier):
+    """(d_east, d_north) arcsec of one replicate measurement (both maps on the reference grid), or None."""
+    try:
+        r = measure_line_offset(line, ref_wcs, ref, ref_wcs, search_radius_arcsec=search_radius_arcsec,
+                                bg_sigma_multiplier=bg_sigma_multiplier, compute_global=False)
+    except ValueError:  # e.g. masking left a map with no finite pixels
+        return None
+    return r["d_east_arcsec"], r["d_north_arcsec"]
+
+
+def estimate_offset_uncertainty(line_flux, line_wcs, ref_flux, ref_wcs, line_err=None, ref_err=None,
+                                 search_radius_arcsec=5.0, bg_sigma_multiplier=3.0,
+                                 block_arcsec=6.0, min_block_pixels=30, n_mc=60, seed=0):
+    """
+    Uncertainty on a measure_line_offset result, from two complementary
+    replicate schemes. Both re-measure with the windowed search only.
+
+    JACKKNIFE (spatial, delete-one-block): the reference-grid footprint is cut
+    into square blocks of ~block_arcsec, each block in turn is removed from
+    BOTH maps, and the offset is re-measured; the standard delete-a-group
+    jackknife variance (g-1)/g * sum (theta_i - mean)^2 follows. This is the
+    sensitivity to WHICH REGIONS drive the correlation -- large when one bright
+    knot dominates, or when different knots disagree. Blocks are far larger than
+    the ~1.8 arcsec cube resolution, so removing one does not leave its own
+    correlated neighbours behind (a per-pixel bootstrap would).
+
+    NOISE MONTE CARLO: n_mc realisations with Gaussian noise drawn from the
+    supplied *_ERR maps, added independently per pixel. Needs line_err and
+    ref_err; skipped (NaN) otherwise. Treat this as a LOWER BOUND on the
+    noise-driven error: real cube noise is spatially correlated over the
+    resampling kernel, which independent per-pixel draws do not reproduce.
+
+    The two are combined in quadrature into sigma_*_arcsec as a working
+    uncertainty (a missing scheme contributes nothing; both missing -> NaN).
+    line may live on a different grid from ref (FRB20250316A): it is reprojected
+    onto the reference grid once, first.
+
+    Returns a dict: jackknife_sigma_east/north_arcsec, n_blocks, mc_sigma_east/
+    north_arcsec, n_mc_ok, sigma_east/north_arcsec, plus the raw replicate
+    arrays (jackknife_offsets, mc_offsets; shape (n, 2) as East, North).
+    """
+    ref_shape = ref_flux.shape
+    ny, nx = ref_shape
+    pix_arcsec = float(np.nanmean(proj_plane_pixel_scales(ref_wcs))) * 3600.0
+    same = _same_celestial_grid(line_wcs, ref_wcs, np.shape(line_flux), ref_shape)
+    on_ref = (lambda a: np.asarray(a, dtype=np.float64)) if same else \
+             (lambda a: reproject_to_reference(np.asarray(a, dtype=np.float64), line_wcs, ref_wcs, ref_shape))
+    line = on_ref(line_flux)
+    ref = np.asarray(ref_flux, dtype=np.float64)
+
+    # ---- spatial delete-one-block jackknife ----
+    block = max(int(round(block_arcsec / pix_arcsec)), 4)
+    yy, xx = np.indices(ref_shape)
+    labels = (yy // block) * (nx // block + 1) + (xx // block)
+    footprint = np.isfinite(line) | np.isfinite(ref)
+    # SHIFT-COMPENSATED masking: a block is removed from the reference where it is, and from
+    # the line map where that same physical region appears in the line map, i.e. translated by
+    # the full-sample shift (rounded to whole pixels). Masking the identical array block in both
+    # maps would instead cut a shifted clump at different places in each; the two sets of sharp
+    # hole edges then align at ZERO shift and drag every replicate toward it -- a spurious
+    # jackknife spread (measured: ~0.7 arcsec on a perfectly uniform 0.8 arcsec shift).
+    full = measure_line_offset(line, ref_wcs, ref, ref_wcs, search_radius_arcsec=search_radius_arcsec,
+                               bg_sigma_multiplier=bg_sigma_multiplier, compute_global=False)
+    sx_int, sy_int = int(round(full["shift_x_pix"])), int(round(full["shift_y_pix"]))
+    src_y, src_x = yy - sy_int, xx - sx_int
+    inside = (src_y >= 0) & (src_y < ny) & (src_x >= 0) & (src_x < nx)
+    labels_in_line = np.where(inside, labels[np.clip(src_y, 0, ny - 1), np.clip(src_x, 0, nx - 1)], -1)
+    jack = []
+    for lab in np.unique(labels[footprint]):
+        in_block = labels == lab
+        if (footprint & in_block).sum() < min_block_pixels:
+            continue
+        rep = _replicate_offset(np.where(labels_in_line == lab, np.nan, line), np.where(in_block, np.nan, ref),
+                                ref_wcs, search_radius_arcsec, bg_sigma_multiplier)
+        if rep is not None:
+            jack.append(rep)
+    jack = np.array(jack).reshape(-1, 2)
+    g = len(jack)
+    jack_sigma = (np.sqrt((g - 1) / g * ((jack - jack.mean(axis=0)) ** 2).sum(axis=0))
+                  if g >= 3 else np.array([np.nan, np.nan]))
+
+    # ---- noise Monte Carlo from the *_ERR maps ----
+    mc = np.empty((0, 2))
+    if n_mc > 0 and line_err is not None and ref_err is not None:
+        line_e, ref_e = on_ref(line_err), np.asarray(ref_err, dtype=np.float64)
+        rng = np.random.default_rng(seed)
+        reps = []
+        for _ in range(n_mc):
+            rep = _replicate_offset(line + rng.standard_normal(ref_shape) * line_e,
+                                    ref + rng.standard_normal(ref_shape) * ref_e,
+                                    ref_wcs, search_radius_arcsec, bg_sigma_multiplier)
+            if rep is not None:
+                reps.append(rep)
+        mc = np.array(reps).reshape(-1, 2)
+    mc_sigma = mc.std(axis=0, ddof=1) if len(mc) >= 3 else np.array([np.nan, np.nan])
+
+    parts = np.vstack([np.where(np.isfinite(jack_sigma), jack_sigma, 0.0), np.where(np.isfinite(mc_sigma), mc_sigma, 0.0)])
+    total = np.sqrt((parts ** 2).sum(axis=0))
+    if not (np.isfinite(jack_sigma).any() or np.isfinite(mc_sigma).any()):
+        total = np.array([np.nan, np.nan])
+
+    return dict(jackknife_sigma_east_arcsec=float(jack_sigma[0]), jackknife_sigma_north_arcsec=float(jack_sigma[1]),
+                n_blocks=g, mc_sigma_east_arcsec=float(mc_sigma[0]), mc_sigma_north_arcsec=float(mc_sigma[1]),
+                n_mc_ok=len(mc), sigma_east_arcsec=float(total[0]), sigma_north_arcsec=float(total[1]),
+                jackknife_offsets=jack, mc_offsets=mc)
+
+
+def _same_celestial_grid(src_wcs, ref_wcs, src_shape, ref_shape):
+    """True when two celestial WCSs (and array shapes) describe the identical pixel grid."""
+    # Compared by GEOMETRY (crpix, crval, pixel-scale matrix, ctype), not via Wcsprm.compare:
+    # the same grid written as a CD matrix vs PC+CDELT compares unequal there.
+    if tuple(src_shape) != tuple(ref_shape):
+        return False
+    a, b = src_wcs.wcs, ref_wcs.wcs
+    return bool(list(a.ctype) == list(b.ctype)
+                and np.allclose(a.crpix, b.crpix, rtol=0, atol=1e-9)
+                and np.allclose(a.crval, b.crval, rtol=0, atol=1e-9)
+                and np.allclose(src_wcs.pixel_scale_matrix, ref_wcs.pixel_scale_matrix, rtol=1e-9, atol=0))
+
+
+def _offset_sampling_map(src_wcs, ref_wcs, src_shape, ref_shape, shift_x=0.0, shift_y=0.0):
+    """
+    Bilinear sampling geometry that puts a source grid onto the reference
+    grid with an extra (shift_x, shift_y) reference-pixel offset (new(p) =
+    src(p + shift)); see the section note. Returns a dict of (4, ny, nx)
+    arrays -- iy, ix (clipped neighbour indices), w (weights), inb (neighbour
+    is inside the source array) -- for the four neighbours (y0,x0), (y0,x0+1),
+    (y0+1,x0), (y0+1,x0+1) of each output pixel.
+
+    Computed once and shared by the 2D and cube resamplers. When the two
+    grids are identical the WCS round-trip is skipped entirely (it would add
+    float noise for no gain), so the four LLAMAS targets get an exact pure
+    pixel shift.
+    """
+    ny, nx = ref_shape
+    yy, xx = np.indices((ny, nx), dtype=float)
+    xs, ys = xx + shift_x, yy + shift_y
+    if _same_celestial_grid(src_wcs, ref_wcs, src_shape, ref_shape):
+        sx, sy = xs, ys
+    else:
+        sx, sy = src_wcs.world_to_pixel(ref_wcs.pixel_to_world(xs, ys))
+    finite = np.isfinite(sx) & np.isfinite(sy)
+    sx = np.where(finite, sx, -10.0)
+    sy = np.where(finite, sy, -10.0)
+
+    x0 = np.floor(sx).astype(int)
+    y0 = np.floor(sy).astype(int)
+    fx, fy = sx - x0, sy - y0
+    sny, snx = src_shape
+    iy = np.stack([y0, y0, y0 + 1, y0 + 1])
+    ix = np.stack([x0, x0 + 1, x0, x0 + 1])
+    w = np.stack([(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy])
+    inb = (iy >= 0) & (iy < sny) & (ix >= 0) & (ix < snx) & finite[None]
+    return dict(iy=np.clip(iy, 0, sny - 1), ix=np.clip(ix, 0, snx - 1), w=w, inb=inb)
+
+
+def _bilinear_gather(a, smap):
+    """
+    Apply an _offset_sampling_map to the last two axes of `a` (2D map or a
+    (nwave, ny, nx) cube).
+
+    NaN / edge handling is a NEAREST-PIXEL rule: NaN or out-of-array neighbours are
+    dropped and the remaining weights renormalised, and the output pixel is kept
+    only if at least _MIN_VALID_WEIGHT (half) of its bilinear weight sat on valid
+    neighbours. So the footprint boundary stays where it was to within half a pixel,
+    and an edge pixel is neither attenuated (renormalised) nor invented from mostly
+    missing data (NaN below the threshold).
+
+    An earlier version was strict (any weighted NaN neighbour -> NaN). That eroded
+    the footprint by up to a pixel and cost 5.7% of the total flux on FRB20250316A's
+    small strip footprint from a mere 0.3 px WCS reprojection (vs <0.3% on a large
+    host), i.e. it removed valid spaxels rather than protecting anything.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    shape = a.shape[:-2] + smap["w"].shape[1:]
+    acc = np.zeros(shape)
+    wvalid = np.zeros(shape)
+    for k in range(4):
+        w = smap["w"][k]
+        vals = a[..., smap["iy"][k], smap["ix"][k]]
+        ok = (w > _W_EPS) & np.isfinite(vals) & smap["inb"][k]
+        acc += np.where(ok, vals, 0.0) * w
+        wvalid += np.where(ok, w, 0.0)
+    return np.where(wvalid >= _MIN_VALID_WEIGHT, acc / np.where(wvalid > 0, wvalid, 1.0), np.nan)
+
+
+def resample_map_with_offset(flux, err, src_wcs, ref_wcs, ref_shape, shift_x=0.0, shift_y=0.0):
+    """
+    Resample a line-flux map and its uncertainty onto the reference grid with
+    an extra (shift_x, shift_y) offset (see the section note for the sign).
+    Returns (flux_out, err_out), both float64.
+
+    The uncertainty is interpolated LINEARLY, not combined in quadrature.
+    Neighbouring cube spaxels are strongly correlated (the cube is built by
+    Gaussian-weighted interpolation over ~0.75 arcsec, on 0.3 arcsec pixels),
+    so the interpolated value's error is close to the weighted MEAN of its
+    neighbours' errors; adding them in quadrature would understate it and
+    inflate S/N right at the S/N cut that defines which spaxels are used.
+    Edge/NaN handling is the nearest-pixel rule in _bilinear_gather; a pixel
+    is NaN in both outputs if either is NaN.
+    """
+    smap = _offset_sampling_map(src_wcs, ref_wcs, np.shape(flux), ref_shape, shift_x, shift_y)
+    f_out = _bilinear_gather(flux, smap)
+    e_out = _bilinear_gather(err, smap)
+    invalid = ~np.isfinite(f_out) | ~np.isfinite(e_out)
+    f_out[invalid] = np.nan
+    e_out[invalid] = np.nan
+    return f_out, e_out
+
+
+def resample_cube_with_offset(flux, var, weight, src_wcs, ref_wcs, ref_shape, shift_x=0.0, shift_y=0.0):
+    """
+    Cube analogue of resample_map_with_offset: every wavelength plane gets the
+    identical spatial resampling (the sampling geometry is computed once).
+    flux, var, weight have shape (nwave, ny, nx). VAR is resampled as the
+    square of the linearly interpolated sigma (same reasoning as the 2D
+    case); WEIGHT is linearly interpolated. Returns (flux, var, weight),
+    float64, shape (nwave, *ref_shape).
+    """
+    smap = _offset_sampling_map(src_wcs, ref_wcs, flux.shape[-2:], ref_shape, shift_x, shift_y)
+    f_out = _bilinear_gather(flux, smap)
+    sigma = np.sqrt(np.where(np.asarray(var, dtype=np.float64) >= 0, var, np.nan))
+    v_out = _bilinear_gather(sigma, smap) ** 2
+    w_out = _bilinear_gather(weight, smap)
+    return f_out, v_out, w_out
+
+
+def _stamp_offset_keywords(header, shifted, shift_x, shift_y, d_east_arcsec, d_north_arcsec,
+                            ref_line, src_path):
+    """Provenance cards for an offset-corrected product (see write_offset_corrected_linemaps)."""
+    header["OFFCORR"] = (bool(shifted), "T=resampled w/ offset; F=unshifted ref")
+    header["OFFREF"] = (ref_line, "Reference line for the offset")
+    header["OFFDXPIX"] = (float(shift_x), "[pix] line-minus-reference shift, x")
+    header["OFFDYPIX"] = (float(shift_y), "[pix] line-minus-reference shift, y")
+    if d_east_arcsec is not None:
+        header["OFFDE_AS"] = (float(d_east_arcsec), "[arcsec] line offset, East of ref")
+        header["OFFDN_AS"] = (float(d_north_arcsec), "[arcsec] line offset, North of ref")
+    header["OFFSRC"] = (os.path.basename(src_path), "Source file before correction")
+    header["OFFNAN"] = ("valid>=50pct", "edge rule; ERR interpolated linearly")
+
+
+def write_offset_corrected_linemaps(src_path, out_path, shift_x, shift_y, ref_wcs, ref_shape,
+                                     shifted_lines, reference_lines=(), passthrough=(),
+                                     d_east_arcsec=None, d_north_arcsec=None, ref_line="HALPHA",
+                                     extra_cards=None):
+    """
+    Write a NEW, minimal linemaps file from src_path in which the
+    `shifted_lines` (e.g. HBETA, OIII_4959, OIII_5007: both {LINE}_FLUX and
+    {LINE}_ERR) are resampled onto the reference grid with the measured offset,
+    while `reference_lines` (e.g. HALPHA, NII_6548, NII_6584) and any
+    `passthrough` extensions (e.g. CONTINUUM_IMG, CONTINUUM_IMG_ERR) are copied
+    across unchanged. Nothing else from src_path is carried over -- no other
+    line, no per-group fit-parameter maps -- so consumers needing those keep
+    using the original file. Names absent from src_path are skipped (e.g. the
+    Halpha-side lines when src_path is FRB20250316A's blue Hbeta/[OIII] file).
+
+    Each output extension keeps its source header (BUNIT, WCSFLIP/WCSROT/...,
+    which _load_corrected_orientation reads back) with two exceptions: a
+    shifted line's WCS is replaced by ref_wcs's (its data now lives on that
+    grid), and provenance cards (see _stamp_offset_keywords) are added.
+    shift_x/shift_y/d_east/d_north are what was APPLIED (0 is a legitimate
+    value: an exact identity copy on an identical grid, or a pure WCS
+    reprojection when the grids differ). extra_cards = {KEY: (value, comment)}
+    is stamped onto every extension and the primary header -- the place to
+    record e.g. a measured-but-not-applied offset and why.
+    Returns the list of extension names written.
+    """
+    hdus = [fits.PrimaryHDU()]
+    written = []
+    ref_wcs_hdr = ref_wcs.to_header()
+    with fits.open(src_path) as hdul:
+        present = {h.name for h in hdul}
+
+        def _copy(name, data, header, shifted):
+            header = header.copy()
+            if shifted:
+                header = _replace_wcs_in_header(header, ref_wcs)
+            _stamp_offset_keywords(header, shifted, shift_x, shift_y, d_east_arcsec, d_north_arcsec,
+                                   ref_line, src_path)
+            for key, card in (extra_cards or {}).items():
+                header[key] = card
+            hdus.append(fits.ImageHDU(data, header=header, name=name))
+            written.append(name)
+
+        for line in shifted_lines:
+            f_name, e_name = f"{line}_FLUX", f"{line}_ERR"
+            if f_name not in present or e_name not in present:
+                continue
+            src_wcs = WCS(hdul[f_name].header).celestial
+            f_out, e_out = resample_map_with_offset(
+                hdul[f_name].data.astype(np.float64), hdul[e_name].data.astype(np.float64),
+                src_wcs, ref_wcs, ref_shape, shift_x, shift_y)
+            _copy(f_name, f_out, hdul[f_name].header, True)
+            _copy(e_name, e_out, hdul[e_name].header, True)
+        for name in [f"{ln}_{s}" for ln in reference_lines for s in ("FLUX", "ERR")] + list(passthrough):
+            if name in present:
+                _copy(name, hdul[name].data, hdul[name].header, False)
+
+    primary = hdus[0].header
+    _stamp_offset_keywords(primary, True, shift_x, shift_y, d_east_arcsec, d_north_arcsec, ref_line, src_path)
+    primary["OFFLINES"] = (",".join(shifted_lines), "Lines resampled with the offset")
+    for key, card in (extra_cards or {}).items():
+        primary[key] = card
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    fits.HDUList(hdus).writeto(out_path, overwrite=True)
+    print(f"Wrote {out_path} ({len(written)} extensions)")
+    return written
+
+
+def write_offset_cube_slabs(slabs, out_path, meta):
+    """
+    Write wavelength slabs of a cube -- already in the corrected sky frame and
+    already offset-corrected where that applies -- into one FITS file.
+
+    slabs: list of dicts, each with keys
+        name   -- short tag, e.g. 'HB_OIII' or 'HA_NII' (prefixes the extensions)
+        wave   -- 1D wavelength array in Angstrom (uniform step)
+        flux, var, weight -- (nwave, ny, nx)
+        wcs2d  -- celestial WCS of the (ny, nx) grid
+        bunit  -- flux unit string
+        shifted -- bool, whether this slab was resampled with the offset
+    meta: dict of primary-header cards (target, redshift, offsets, source files, ...).
+
+    Per slab: {name}_FLUX / _VAR / _WEIGHT (3D, WCS = celestial + a linear
+    Angstrom axis) and {name}_WAVE (the explicit wavelength array, which
+    read_offset_cube_slabs uses instead of trusting the header axis).
+    Arrays are stored float32 like the source cubes.
+    """
+    primary = fits.PrimaryHDU()
+    for key, value in meta.items():
+        primary.header[key[:8].upper()] = value
+    primary.header["SLABS"] = (",".join(s["name"] for s in slabs), "Slab tags in this file")
+    hdus = [primary]
+    for s in slabs:
+        wave = np.asarray(s["wave"], dtype=np.float64)
+        step = float(np.median(np.diff(wave)))
+        wcs3d = WCS(naxis=3)
+        wcs3d.wcs.ctype = [s["wcs2d"].wcs.ctype[0], s["wcs2d"].wcs.ctype[1], "WAVE"]
+        wcs3d.wcs.cunit = [s["wcs2d"].wcs.cunit[0], s["wcs2d"].wcs.cunit[1], "Angstrom"]
+        wcs3d.wcs.crpix = [s["wcs2d"].wcs.crpix[0], s["wcs2d"].wcs.crpix[1], 1.0]
+        wcs3d.wcs.crval = [s["wcs2d"].wcs.crval[0], s["wcs2d"].wcs.crval[1], float(wave[0])]
+        cd = np.eye(3)
+        cd[:2, :2] = s["wcs2d"].pixel_scale_matrix
+        cd[2, 2] = step
+        wcs3d.wcs.cd = cd
+        wcs3d.wcs.radesys = s["wcs2d"].wcs.radesys
+        for kind in ("FLUX", "VAR", "WEIGHT"):
+            hdr = wcs3d.to_header()
+            hdr["BUNIT"] = (s.get("bunit", "") if kind == "FLUX" else "", "")
+            hdr["OFFSHIFT"] = (bool(s.get("shifted", False)), "Slab resampled with the line offset")
+            hdus.append(fits.ImageHDU(np.asarray(s[kind.lower()], dtype=np.float32), header=hdr,
+                                      name=f"{s['name']}_{kind}"))
+        hdus.append(fits.ImageHDU(wave, name=f"{s['name']}_WAVE"))
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    fits.HDUList(hdus).writeto(out_path, overwrite=True)
+    print(f"Wrote {out_path} (slabs: {', '.join(s['name'] for s in slabs)})")
+    return out_path
+
+
+def read_offset_cube_slabs(path):
+    """
+    Read a file written by write_offset_cube_slabs. Returns {name: dict(wave, flux, var, weight,
+    wcs2d, bunit, shifted)} with the arrays as float64, plus the primary header under the key 'meta'.
+    """
+    out = {}
+    with fits.open(path) as hdul:
+        tags = [t for t in hdul[0].header["SLABS"].split(",") if t]
+        for tag in tags:
+            out[tag] = dict(
+                wave=hdul[f"{tag}_WAVE"].data.astype(np.float64),
+                flux=hdul[f"{tag}_FLUX"].data.astype(np.float64),
+                var=hdul[f"{tag}_VAR"].data.astype(np.float64),
+                weight=hdul[f"{tag}_WEIGHT"].data.astype(np.float64),
+                wcs2d=WCS(hdul[f"{tag}_FLUX"].header).celestial,
+                bunit=hdul[f"{tag}_FLUX"].header.get("BUNIT", ""),
+                shifted=bool(hdul[f"{tag}_FLUX"].header.get("OFFSHIFT", False)),
+            )
+        out["meta"] = hdul[0].header.copy()
+    return out
+
+
+# ----------------------------------------------------------------------
 # Diagnostic plot
 # ----------------------------------------------------------------------
 def plot_alignment_diagnostic(reference_data, reference_wcs, line_data, corrected_line_wcs,
                                target_name, line_name, out_path,
                                contour_sigma_multiples=(3, 6, 14, 30, 65, 140, 300),
-                               vmin_sigma_floor=10.0, qso_coord=None):
+                               vmin_sigma_floor=10.0, qso_coord=None,
+                               background_sigma_range=None, extra_contours=None):
+    """
+    extra_contours: optional list of additional maps to contour on the same
+    axes alongside (line_data, corrected_line_wcs) -- each a dict with
+    'data', 'name', 'color', and optionally 'wcs' (defaults to
+    corrected_line_wcs, i.e. the same grid as the primary map -- true for
+    e.g. Halpha/NII/CONTINUUM_IMG, which all live in one target's own
+    corrected_linemaps file) and 'contour_sigma_multiples' (defaults to this
+    call's own). Each gets a legend entry; the primary map stays red as
+    before, so an existing single-map call is completely unaffected.
+    """
     # Display-only reprojection: the reference image on disk may not be
     # North-up/East-left (see _display_orientation_wcs) even though its WCS
     # correctly records whatever orientation it actually has. Statistics
@@ -1029,47 +1626,69 @@ def plot_alignment_diagnostic(reference_data, reference_wcs, line_data, correcte
 
     fig, ax = plt.subplots(figsize=(7, 7), subplot_kw={"projection": display_wcs})
     _, ref_med, ref_std = sigma_clipped_stats(reference_data, sigma=3.0)
-    vmax = float(np.nanmax(reference_data))
-    # Log stretch with a floor above the background level (LogStretch needs
-    # positive values), vmax near the image peak. A higher vmin_sigma_floor
-    # clips more of the smooth diffuse galaxy light, revealing bright compact
-    # structure instead of a smooth blob; a lower one keeps more of the
-    # extended, fainter light visible at the cost of some background noise
-    # texture -- the right choice depends on whether you're checking gross
-    # alignment against faint extended structure or fine alignment against a
-    # bright compact feature. The floor is capped at half the image's actual
-    # peak significance: a fixed high floor (e.g. 10 sigma) works for a
-    # high-contrast reference (e.g. a bright galaxy core well above
-    # background) but can exceed vmax entirely for a fainter/lower-contrast
-    # one (confirmed for FRB20250227A's g-band cutout, peak only ~9.5 sigma
-    # above background) -- ImageNormalize requires vmin < vmax, so this keeps
-    # the floor meaningful instead of erroring or silently degrading to a
-    # near-empty display.
-    peak_sigma = (vmax - ref_med) / ref_std if ref_std > 0 else 10.0
-    floor_sigma = min(vmin_sigma_floor, 0.5 * peak_sigma) if peak_sigma > 0 else 1.0
-    vmin = ref_med + floor_sigma * ref_std
+    if background_sigma_range is not None:
+        # Explicit override: stretch strictly between
+        # median + lo_sigma*std and median + hi_sigma*std, ignoring the
+        # image's own peak entirely -- useful for a low-contrast reference
+        # (e.g. FRB20250227A's g-band cutout, peak only ~9.5 sigma above
+        # background) where the default peak-anchored vmax below leaves the
+        # sigma-floor logic fighting the actual dynamic range.
+        lo_sigma, hi_sigma = background_sigma_range
+        vmin = ref_med + lo_sigma * ref_std
+        vmax = ref_med + hi_sigma * ref_std
+    else:
+        vmax = float(np.nanmax(reference_data))
+        # Log stretch with a floor above the background level (LogStretch needs
+        # positive values), vmax near the image peak. A higher vmin_sigma_floor
+        # clips more of the smooth diffuse galaxy light, revealing bright compact
+        # structure instead of a smooth blob; a lower one keeps more of the
+        # extended, fainter light visible at the cost of some background noise
+        # texture -- the right choice depends on whether you're checking gross
+        # alignment against faint extended structure or fine alignment against a
+        # bright compact feature. The floor is capped at half the image's actual
+        # peak significance: a fixed high floor (e.g. 10 sigma) works for a
+        # high-contrast reference (e.g. a bright galaxy core well above
+        # background) but can exceed vmax entirely for a fainter/lower-contrast
+        # one (confirmed for FRB20250227A's g-band cutout, peak only ~9.5 sigma
+        # above background) -- ImageNormalize requires vmin < vmax, so this keeps
+        # the floor meaningful instead of erroring or silently degrading to a
+        # near-empty display.
+        peak_sigma = (vmax - ref_med) / ref_std if ref_std > 0 else 10.0
+        floor_sigma = min(vmin_sigma_floor, 0.5 * peak_sigma) if peak_sigma > 0 else 1.0
+        vmin = ref_med + floor_sigma * ref_std
     norm = ImageNormalize(stretch=LogStretch(), vmin=vmin, vmax=vmax)
     ax.imshow(display_data, origin="lower", cmap="Greys_r", norm=norm)
 
-    _, med, std = sigma_clipped_stats(line_data, sigma=3.0)
-    levels = sorted(med + n * std for n in contour_sigma_multiples)
-    plot_data = np.where(np.isfinite(line_data), line_data, -np.inf)
-    # Drop any level with no pixel reaching it before calling ax.contour: astropy's
-    # WCS contour transform (transform_contour_set_inplace) raises an IndexError on
-    # a fully-empty contour collection rather than just drawing nothing, and a
-    # per-spaxel fit-flux map (mostly hard zeros outside its own narrowband fit
-    # mask, real signal only in a small compact population) can push
-    # sigma_clipped_stats' std well above the map's actual peak for a faint
-    # target -- confirmed for FRB20211127I's Hbeta map, where even the lowest
-    # (3-sigma) level had zero qualifying pixels. Skip contouring entirely (with
-    # a warning) if every level is empty, rather than crashing the whole plot.
-    levels = [lv for lv in levels if np.any(plot_data >= lv)]
-    if levels:
-        ax.contour(plot_data, levels=levels, transform=ax.get_transform(corrected_line_wcs),
-                   colors="red", linewidths=1.0)
-    else:
-        warnings.warn(f"[{target_name}] {line_name}: no contour level has any qualifying pixel "
+    def draw_contours(data, wcs, name, color, sigma_multiples):
+        # Drop any level with no pixel reaching it before calling ax.contour: astropy's
+        # WCS contour transform (transform_contour_set_inplace) raises an IndexError on
+        # a fully-empty contour collection rather than just drawing nothing, and a
+        # per-spaxel fit-flux map (mostly hard zeros outside its own narrowband fit
+        # mask, real signal only in a small compact population) can push
+        # sigma_clipped_stats' std well above the map's actual peak for a faint
+        # target -- confirmed for FRB20211127I's Hbeta map, where even the lowest
+        # (3-sigma) level had zero qualifying pixels. Skip contouring entirely (with
+        # a warning) if every level is empty, rather than crashing the whole plot.
+        _, m, s = sigma_clipped_stats(data, sigma=3.0)
+        lvls = sorted(m + n * s for n in sigma_multiples)
+        plot_data = np.where(np.isfinite(data), data, -np.inf)
+        lvls = [lv for lv in lvls if np.any(plot_data >= lv)]
+        if lvls:
+            ax.contour(plot_data, levels=lvls, transform=ax.get_transform(wcs),
+                       colors=color, linewidths=1.0)
+            return True
+        warnings.warn(f"[{target_name}] {name}: no contour level has any qualifying pixel "
                        "(map too faint/sparse relative to contour_sigma_multiples); skipping contours")
+        return False
+
+    legend_handles = []
+    if draw_contours(line_data, corrected_line_wcs, line_name, "red", contour_sigma_multiples):
+        legend_handles.append(Line2D([], [], color="red", lw=1.5, label=line_name))
+    for extra in (extra_contours or []):
+        ok = draw_contours(extra["data"], extra.get("wcs", corrected_line_wcs), extra["name"],
+                            extra["color"], extra.get("contour_sigma_multiples", contour_sigma_multiples))
+        if ok:
+            legend_handles.append(Line2D([], [], color=extra["color"], lw=1.5, label=extra["name"]))
 
     if qso_coord is not None:
         # Plotted directly in the sky/world frame (get_transform("world")), so this
@@ -1077,10 +1696,16 @@ def plot_alignment_diagnostic(reference_data, reference_wcs, line_data, correcte
         # parity check: this marker should land exactly on the visible point source
         # in the reference image; if the line-map contours end up mirrored to the
         # wrong side of it, that's a chirality (flip_axis) error, not a translation one.
-        ax.scatter(qso_coord.ra.deg, qso_coord.dec.deg, transform=ax.get_transform("world"),
-                   marker="x", s=150, linewidths=2.2, color="cyan", zorder=6,
-                   label="QSO (refined)")
-        ax.legend(loc="lower left", fontsize=8, framealpha=0.7)
+        qso_handle = ax.scatter(qso_coord.ra.deg, qso_coord.dec.deg, transform=ax.get_transform("world"),
+                                 marker="x", s=150, linewidths=2.2, color="cyan", zorder=6,
+                                 label="QSO (refined)")
+        legend_handles.append(qso_handle)
+
+    # A legend only adds information once there's more than one contour/marker
+    # to distinguish -- the original single-line, no-QSO call (still the
+    # common case) stays visually identical to before.
+    if len(legend_handles) > 1:
+        ax.legend(handles=legend_handles, loc="lower left", fontsize=8, framealpha=0.7)
 
     ax.set_title(f"{target_name} -- {line_name} astrometry check")
     ax.set_xlabel("RA")
