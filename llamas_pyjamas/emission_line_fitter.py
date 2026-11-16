@@ -79,7 +79,7 @@ from matplotlib.patches import Ellipse
 # *_linemaps.fits's primary header by save_fits (see maps["_provenance"] in
 # fit_cube/fit_target) so a given FITS file's fitting config is recoverable
 # without having to track down which version of this module produced it.
-EMISSION_LINE_FITTER_VERSION = "2026.09.16"
+EMISSION_LINE_FITTER_VERSION = "2026.11.04"
 
 
 # ----------------------------------------------------------------------
@@ -1409,6 +1409,19 @@ def select_topk_by_snr(fit_mask, snr_image, topk_frac=0.05, min_topk=1):
     return iy_all[order], ix_all[order]
 
 
+def adopted_broad_sigma(broad_sigma_values, bounds=BROAD_SIGMA_BOUNDS_AA):
+    """
+    The width to hold fixed from the pre-fits' broad sigmas: their median, unless that median sits on a
+    bound (within 1%), in which case the median of the fits off both bounds. A fit pinned at a bound
+    only says the width lies outside the allowed range, so a median on the bound isn't a measurement.
+    """
+    values = np.asarray(broad_sigma_values, dtype=float)
+    lo, hi = bounds
+    off_bound = values[(values > 1.01 * lo) & (values < 0.99 * hi)]
+    median = float(np.median(values))
+    return float(np.median(off_bound)) if off_bound.size and not 1.01 * lo < median < 0.99 * hi else median
+
+
 def determine_group_sigma(wave, flux, var, weight, avail, z, dz_max, sigma_init,
                            sigma_bounds, tie_doublets, window_pad, topk_iy, topk_ix,
                            poly_order=3, continuum_mask_halfwidth_sigma=4.0,
@@ -1428,9 +1441,10 @@ def determine_group_sigma(wave, flux, var, weight, avail, z, dz_max, sigma_init,
     top-S/N pre-fit pass rather than a second one).
 
     Returns (sigma_fixed, sigma_values, broad_sigma_fixed, broad_sigma_values):
-    sigma_fixed/broad_sigma_fixed = float(np.median(the successful fits' own
-    values)), the single values fit_cube then holds fixed for every spaxel in
-    this group's main fitting pass. sigma_fixed is None (and sigma_values
+    sigma_fixed = float(np.median(the successful fits' own values)) and
+    broad_sigma_fixed = adopted_broad_sigma(their broad widths), the single
+    values fit_cube then holds fixed for every spaxel in this group's main
+    fitting pass. sigma_fixed is None (and sigma_values
     empty) if none of the pre-fits succeeded, so the caller can skip the
     whole group; broad_sigma_fixed/broad_sigma_values are (None, empty
     array) whenever broad_component is None, or if it's given but none of
@@ -1455,7 +1469,7 @@ def determine_group_sigma(wave, flux, var, weight, avail, z, dz_max, sigma_init,
     broad_sigma_values = np.array(broad_sigma_values, dtype=float)
 
     sigma_fixed = float(np.median(sigma_values)) if sigma_values.size else None
-    broad_sigma_fixed = float(np.median(broad_sigma_values)) if broad_sigma_values.size else None
+    broad_sigma_fixed = adopted_broad_sigma(broad_sigma_values, broad_sigma_bounds) if broad_sigma_values.size else None
     return sigma_fixed, sigma_values, broad_sigma_fixed, broad_sigma_values
 
 
@@ -1498,7 +1512,7 @@ def plot_broad_sigma_histogram(broad_sigma_values, broad_sigma_fixed, outdir, ta
     bins = min(20, max(5, broad_sigma_values.size))
     ax.hist(broad_sigma_values, bins=bins, color="darkorange", edgecolor="black")
     ax.axvline(broad_sigma_fixed, color="red", ls="--", lw=2,
-               label=f"median = {broad_sigma_fixed:.3f} Angstrom")
+               label=f"adopted = {broad_sigma_fixed:.3f} Angstrom")
     ax.set_xlabel("Fitted broad (absorption) sigma (Angstrom)")
     ax.set_ylabel("Number of spaxels")
     ax.set_title(f"{target_name} -- {group_name} broad sigma distribution "
